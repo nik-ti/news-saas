@@ -1,0 +1,89 @@
+"""
+SQLite database schema initialization and connection helper.
+"""
+import sqlite3
+import os
+import logging
+import config
+
+logger = logging.getLogger(__name__)
+
+
+def get_connection() -> sqlite3.Connection:
+    """Return a SQLite connection with row factory."""
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+
+def init_db() -> None:
+    """Create all tables if they don't exist."""
+    os.makedirs(os.path.dirname(config.DB_PATH), exist_ok=True)
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS streams (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id     INTEGER NOT NULL,
+        name        TEXT    NOT NULL,
+        criteria    TEXT    NOT NULL,    -- JSON SourceCriteriaProfile
+        status      TEXT    DEFAULT 'active',  -- active | paused | researching
+        created_at  TEXT    DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS sources (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        stream_id       INTEGER NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
+        url             TEXT    NOT NULL,
+        name            TEXT,
+        broad_category  TEXT,
+        specific_keywords TEXT,          -- JSON array
+        description     TEXT,
+        quality_score   INTEGER DEFAULT 0,
+        fetch_status    TEXT    DEFAULT 'active',  -- active | blocked | error
+        feed_url        TEXT,
+        fail_count      INTEGER DEFAULT 0,
+        last_checked    TEXT,
+        last_fetched    TEXT,
+        created_at      TEXT    DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS articles (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_id       INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        title           TEXT,
+        url             TEXT,
+        summary         TEXT,
+        relevance_score REAL    DEFAULT 0,
+        status          TEXT    DEFAULT 'new',   -- new | processed | irrelevant
+        fetched_at      TEXT    DEFAULT (datetime('now')),
+        delivered_at    TEXT,
+        content_hash    TEXT    -- for dedup
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_sources_stream ON sources(stream_id);
+    CREATE INDEX IF NOT EXISTS idx_articles_source ON articles(source_id);
+    CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status);
+    """)
+
+    # Migrations for databases created before these columns existed
+    # (must run AFTER table creation, or a fresh DB has no sources table to alter)
+    existing_cols = {row[1] for row in cur.execute("PRAGMA table_info(sources)")}
+    for col, ddl in [
+        ("feed_url", "ALTER TABLE sources ADD COLUMN feed_url TEXT"),
+        ("fail_count", "ALTER TABLE sources ADD COLUMN fail_count INTEGER DEFAULT 0"),
+    ]:
+        if col not in existing_cols:
+            cur.execute(ddl)
+            logger.info("Migration: added %s column to sources table", col)
+
+    conn.commit()
+    conn.close()
+
+
+if __name__ == "__main__":
+    init_db()
+    print(f"Database initialized at {config.DB_PATH}")

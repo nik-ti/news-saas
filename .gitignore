@@ -1,0 +1,26 @@
+# Environment
+.env
+bot.log
+test_output.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Database
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Playwright MCP temp
+tmp/
