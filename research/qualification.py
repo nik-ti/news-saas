@@ -68,10 +68,21 @@ Output valid JSON:
   "recommendation": "<'accept', 'reject', or 'borderline'>",
   "source_name": "<the name of the site/publication>",
   "broad_category": "<the broad news category this belongs to>",
+  "site_type": "<one of: news_site, company_blog, aggregator, analysis, other>",
   "specific_keywords": ["<3-5 keywords describing what this source focuses on>"],
-  "description": "<1-2 sentence description of this source>",
+  "description": "<2 sentences. Sentence 1: what this SITE is (a dedicated news outlet? a specific company's blog? a news aggregator? an analysis/research shop?). Sentence 2: what the news page we'll follow actually focuses on.>",
   "feed_url": "<the full URL of the article list/feed page we should crawl>"
 }
+
+site_type guide:
+- news_site: a dedicated news publication (CoinDesk, Reuters)
+- company_blog: a specific company writing about itself/its domain (a product blog)
+- aggregator: republishes or links out to news from many other sources
+- analysis: research, commentary, or deep-dive analysis rather than breaking news
+- other: anything that fits none of the above
+
+Make the description CONCRETE and specific to THIS site — not a generic line that
+could describe any site in the category. Name what it actually covers.
 
 Scoring: 90-100 perfect, 70-89 strong, 50-69 partial, 0-49 poor.
 Be strict. No evidence = reject."""

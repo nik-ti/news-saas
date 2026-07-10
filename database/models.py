@@ -40,11 +40,13 @@ def init_db() -> None:
         url             TEXT    NOT NULL,
         name            TEXT,
         broad_category  TEXT,
+        site_type       TEXT,            -- news_site | company_blog | aggregator | analysis | other
         specific_keywords TEXT,          -- JSON array
         description     TEXT,
         quality_score   INTEGER DEFAULT 0,
         fetch_status    TEXT    DEFAULT 'active',  -- active | blocked | error
         feed_url        TEXT,
+        fetch_method    TEXT,            -- rss | links | inline — the proven way to read this source
         fail_count      INTEGER DEFAULT 0,
         last_checked    TEXT,
         last_fetched    TEXT,
@@ -79,6 +81,8 @@ def init_db() -> None:
             ("feed_url", "ALTER TABLE sources ADD COLUMN feed_url TEXT"),
             ("fail_count", "ALTER TABLE sources ADD COLUMN fail_count INTEGER DEFAULT 0"),
             ("baselined_at", "ALTER TABLE sources ADD COLUMN baselined_at TEXT"),
+            ("site_type", "ALTER TABLE sources ADD COLUMN site_type TEXT"),
+            ("fetch_method", "ALTER TABLE sources ADD COLUMN fetch_method TEXT"),
         ],
         "articles": [
             ("posted_at", "ALTER TABLE articles ADD COLUMN posted_at TEXT"),

@@ -72,18 +72,22 @@ def add_source(
     quality_score: int = 0,
     fetch_status: str = "active",
     feed_url: str = "",
+    site_type: str = "",
+    fetch_method: str = "",
 ) -> int:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         """INSERT INTO sources
-           (stream_id, url, name, broad_category, specific_keywords, description,
-            quality_score, fetch_status, last_checked, feed_url)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)""",
+           (stream_id, url, name, broad_category, site_type, specific_keywords,
+            description, quality_score, fetch_status, last_checked, feed_url,
+            fetch_method)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)""",
         (
-            stream_id, url, name, broad_category,
+            stream_id, url, name, broad_category, site_type or None,
             json.dumps(specific_keywords or []),
             description, quality_score, fetch_status, feed_url or url,
+            fetch_method or None,
         ),
     )
     conn.commit()

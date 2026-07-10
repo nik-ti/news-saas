@@ -274,7 +274,13 @@ async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     detail_parts = ["\n---\n## Details\n"]
     for src in sources:
-        detail_parts.append(f"\n**`{src['id']}` — {src.get('name') or src['url']}**")
+        type_label = {"news_site": "📰 News site", "company_blog": "🏢 Company blog",
+                      "aggregator": "🔗 Aggregator", "analysis": "🔬 Analysis"}.get(
+                          src.get("site_type"), "")
+        header = f"\n**`{src['id']}` — {src.get('name') or src['url']}**"
+        if type_label:
+            header += f"  · {type_label}"
+        detail_parts.append(header)
         detail_parts.append(f"- Site: {src['url']}")
         if src.get("feed_url") and src["feed_url"] != src["url"]:
             detail_parts.append(f"- Polling: {src['feed_url']}")
@@ -436,6 +442,7 @@ async def _store_discovered_source(chat_id: int, stream_id: int, site_url: str,
     source_id = store.add_source(
         stream_id=stream_id, url=site_url, name=name,
         feed_url=cand.url, fetch_status="active",
+        fetch_method="rss" if cand.kind == "feed" else "links",
     )
     kind = "RSS feed" if cand.kind == "feed" else "article page"
 

@@ -198,16 +198,27 @@ def _feed_url_of(q: dict) -> str:
     return q.get("feed_url") or q["url"]
 
 
+def _fetch_method_of(q: dict) -> str:
+    """The proven way to read this source, so the poller needn't re-guess."""
+    from pipeline.fetch_news import RSS_URL_HINTS
+    feed = _feed_url_of(q).lower()
+    if any(h in feed for h in RSS_URL_HINTS):
+        return "rss"
+    return "links"  # a crawlable article-list page
+
+
 def _to_source_dict(q: dict, fetch_status: str = "active") -> dict:
     return {
         "url": q["url"],
         "name": q.get("source_name", ""),
         "broad_category": q.get("broad_category", ""),
+        "site_type": q.get("site_type", ""),
         "specific_keywords": q.get("specific_keywords", []),
         "description": q.get("description", ""),
         "quality_score": q.get("match_score", 0),
         "fetch_status": fetch_status,
         "feed_url": _feed_url_of(q),
+        "fetch_method": _fetch_method_of(q),
     }
 
 

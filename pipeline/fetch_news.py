@@ -159,8 +159,13 @@ async def snapshot_source(source: dict) -> list[dict]:
     url = source["url"]
     feed_url = source.get("feed_url") or url
 
-    # Strategy 0: RSS/Atom feed — parse directly, no browser needed
-    if any(h in feed_url.lower() for h in RSS_URL_HINTS):
+    # Strategy 0: RSS/Atom feed — parse directly, no browser needed.
+    # Prefer the method proven at discovery time; fall back to a URL sniff so
+    # legacy sources (no stored method) still work. This is what lets a feed at
+    # a clean URL like /index~atom.xml be read as RSS even without an obvious hint.
+    method = (source.get("fetch_method") or "").lower()
+    looks_rss = method == "rss" or any(h in feed_url.lower() for h in RSS_URL_HINTS)
+    if looks_rss:
         rss_items = await fetch_rss_items(feed_url)
         if rss_items:
             items = [_item(i["title"], i["url"], i.get("summary", "")) for i in rss_items]
