@@ -60,6 +60,7 @@ deliver relevant news directly to you.
 | `/research <stream_id>` | Re-run research for a stream |
 | `/latest` | Show latest fetched articles |
 | `/runpipeline` | Run fetch → summarize → deliver now |
+| `/postsize <stream_id>` | Choose post length (standard / compact) |
 | `/status` | Show system status |
 
 ---
@@ -125,16 +126,52 @@ async def _start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     store.update_stream_status(stream_id, "researching")
     context.user_data["stream_id"] = stream_id
 
-    await send_rich_async(update.effective_chat.id, f"""\
-🔎 On it — I'm reading through the best sources on this now.
-
-This usually takes a minute or two. I'll send them over as soon as they're ready.\
-""")
-
     chat_id = update.effective_chat.id
+    await context.bot.send_message(
+        chat_id,
+        "🔎 On it — I'm reading through the best sources on this now. This usually "
+        "takes a minute or two.\n\nWhile I work: how long should each post be? "
+        "(Standard by default — change anytime with /postsize.)",
+        reply_markup=_post_length_keyboard(stream_id),
+    )
+
     asyncio.create_task(_run_research_background(stream_id, answers, chat_id, context))
 
     return ConversationHandler.END
+
+
+def _post_length_keyboard(stream_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📄 Standard (~100 words)", callback_data=f"plen:{stream_id}:standard"),
+        InlineKeyboardButton("⚡ Compact", callback_data=f"plen:{stream_id}:compact"),
+    ]])
+
+
+async def cmd_postsize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set how long a stream's posts are."""
+    chat_id = update.effective_chat.id
+    if not context.args:
+        streams = store.get_streams_by_user(update.effective_user.id)
+        if not streams:
+            await send_rich_async(chat_id, "You have no streams yet. Use `/newstream`.")
+            return
+        await send_rich_async(chat_id, "Usage: `/postsize <stream_id>` — I'll show the options.")
+        return
+    try:
+        stream_id = int(context.args[0])
+    except ValueError:
+        await send_rich_async(chat_id, "Invalid stream ID.")
+        return
+    owns, stream = await _owns_stream(update.effective_user.id, stream_id)
+    if stream is None or not owns:
+        await send_rich_async(chat_id, "❌ That stream isn't yours.")
+        return
+    current = (stream.get("criteria") or {}).get("post_length", "standard")
+    await context.bot.send_message(
+        chat_id,
+        f"Posts for *{stream['name']}* are currently *{current}*. Pick a size:".replace("*", ""),
+        reply_markup=_post_length_keyboard(stream_id),
+    )
 
 
 async def _run_research_background(stream_id: int, answers: dict, chat_id: int,
@@ -516,6 +553,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(
             ("🗑️ Deleted." if ok else "Couldn't delete that one."))
         await send_rich_async(chat_id, msg)
+        return
+
+    # ── Post length ───────────────────────────────────────────────────
+    if data.startswith("plen:"):
+        _, sid, length = data.split(":", 2)
+        owns, _stream = await _owns_stream(user_id, int(sid))
+        if not owns:
+            await query.edit_message_text("That stream isn't yours.")
+            return
+        store.set_post_length(int(sid), length)
+        pretty = "Standard (~100 words)" if length == "standard" else "Compact"
+        await query.edit_message_text(f"✅ Posts set to {pretty}.")
         return
 
     # ── Re-test a source ──────────────────────────────────────────────

@@ -14,9 +14,14 @@ logger = logging.getLogger(__name__)
 SKIP = "SKIP"
 
 SYSTEM_PROMPT_SUMMARIZE = """\
-You are a news summarizer. Given an article title and page content, produce a \
-concise 2-4 sentence summary that captures the key information: what happened, \
-who it affects, and when.
+You are a news summarizer. Given an article title and page content, capture ALL \
+the important details a reader would want: what happened, who is involved, who it \
+affects, when it takes effect, the key numbers, and any essential context.
+
+Be complete but not padded — include everything that matters and nothing that \
+doesn't. This summary is the ONLY thing a later step sees when writing the post, \
+so anything you omit is lost. Aim for a full, informative paragraph (roughly \
+120-180 words) when the article supports it; less if it's genuinely short.
 
 Preserve the source's certainty. "Proposed" is not "approved"; "could" is not "will".
 
@@ -24,7 +29,7 @@ If the content is not a news article — a paywall, a login page, a navigation o
 category listing, a cookie notice, or an empty page — output exactly:
 {"summary": "SKIP"}
 
-Otherwise output JSON: {"summary": "<2-4 sentence summary>"}
+Otherwise output JSON: {"summary": "<the summary>"}
 No markdown, no explanation."""
 
 

@@ -389,6 +389,19 @@ def update_stream_criteria(stream_id: int, criteria: dict) -> None:
     conn.close()
 
 
+def set_post_length(stream_id: int, length: str) -> bool:
+    """Set a stream's post-length preference ('standard' | 'compact')."""
+    stream = get_stream(stream_id)
+    if not stream:
+        return False
+    criteria = stream.get("criteria") or {}
+    if not isinstance(criteria, dict):
+        criteria = {}
+    criteria["post_length"] = length
+    update_stream_criteria(stream_id, criteria)
+    return True
+
+
 def mark_articles_delivered(article_ids: list[int]) -> None:
     conn = get_connection()
     conn.executemany(

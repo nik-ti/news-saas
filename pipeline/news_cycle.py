@@ -179,8 +179,10 @@ async def _post_phase() -> dict:
                 stats["irrelevant"] += 1
                 continue
 
-            post_html = await write_post(summary, title=title,
-                                         source_url=article.get("url", ""))
+            post_html = await write_post(
+                summary, title=title, source_url=article.get("url", ""),
+                length=profile.get("post_length", "standard"),
+            )
             if not post_html or len(post_html) < 20:
                 stats[_retry_or_drop(article_id, "post writer returned nothing")] += 1
                 continue

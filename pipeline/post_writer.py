@@ -59,7 +59,7 @@ entire long article. Before writing, identify: (1) the ONE main piece of news, \
 * First line: the headline, wrapped in <b>...</b>, optionally ending with one emoji.
 * Blank line, then the body.
 
-**Length:** 400-700 characters (including HTML tags and emojis).
+**Length:** {length_rule}
 
 **Emojis:** 1-3, used naturally. Common: 📊 📌 ⚠️ ✅ 🔹 📎 ➡️ 🏛 💼 🔬
 
@@ -92,11 +92,26 @@ MiCA (Markets in Crypto-Assets) is the EU's unified crypto framework, phased in 
 **Output:** A short Telegram news post in English, HTML format."""
 
 
-async def write_post(summary_text: str, title: str = "", source_url: str = "") -> str:
+# The one line that changes with the user's chosen post length.
+_LENGTH_RULES = {
+    "standard": "80-100 words. Give the reader the full picture — the what, "
+                "who, when, and why it matters — in tight prose.",
+    "compact": "2-3 sentences, ~40 words max. Just the essential news, nothing more.",
+}
+
+
+def _length_rule(length: str) -> str:
+    return _LENGTH_RULES.get(length, _LENGTH_RULES["standard"])
+
+
+async def write_post(summary_text: str, title: str = "", source_url: str = "",
+                     length: str = "standard") -> str:
     """
-    Write a short Telegram post from an article summary.
+    Write a Telegram post from an article summary, at the stream's chosen length.
     Returns Telegram-HTML ready to send, with a source link appended.
     """
+    system = SYSTEM_MESSAGE.replace("{length_rule}", _length_rule(length))
+
     parts = []
     if title:
         parts.append(f"Title: {title}")
@@ -104,7 +119,7 @@ async def write_post(summary_text: str, title: str = "", source_url: str = "") -
     prompt = "\n\n".join(parts)
 
     try:
-        raw = await chat_post(SYSTEM_MESSAGE, prompt)
+        raw = await chat_post(system, prompt)
     except Exception as e:
         logger.error("Post writer error: %s", e)
         return ""

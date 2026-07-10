@@ -31,6 +31,7 @@ from bot.handlers import (
     cmd_latest,
     cmd_runpipeline,
     cmd_status,
+    cmd_postsize,
     # Conversation handler (single natural interview loop)
     handle_interview,
     cancel_conversation,
@@ -141,6 +142,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("runpipeline", cmd_runpipeline))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("postsize", cmd_postsize))
     # Inline keyboards are inert without this.
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(error_handler)
