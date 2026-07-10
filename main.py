@@ -71,9 +71,12 @@ async def cron_news_cycle(context):
 
 
 async def cron_health_check(context):
-    """Cron: re-test sources that errored out and bring the healthy ones back.
+    """Cron: re-test sidelined sources and bring the healthy ones back.
 
-    Only touches 'error' sources — a 'blocked' source stays blocked.
+    Covers both 'error' (repeated fetch failures) and 'blocked' (the crawler was
+    refused). Neither is set by the user — they only ever mean "we couldn't read
+    it that day", and a site that rate-limited us during research is usually
+    perfectly readable later. Leaving 'blocked' out would strand it forever.
     """
     from database import store
     from crawler.fetcher import test_source
@@ -82,17 +85,19 @@ async def cron_health_check(context):
     from database.models import get_connection
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, url, feed_url FROM sources WHERE fetch_status = 'error'"
+        "SELECT id, url, feed_url FROM sources "
+        "WHERE fetch_status IN ('error', 'blocked')"
     ).fetchall()
     conn.close()
 
     reactivated = 0
     for row in rows:
-        # Test the page the pipeline actually crawls
+        # Test the page the pipeline actually crawls, one at a time.
         result = await test_source(row["feed_url"] or row["url"])
         if result["fetchable"]:
             store.reactivate_source(row["id"])
             reactivated += 1
+        await asyncio.sleep(1)
 
     if reactivated > 0:
         send_rich(config.TELEGRAM_CHAT_ID,

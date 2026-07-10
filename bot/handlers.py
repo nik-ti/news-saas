@@ -156,32 +156,41 @@ async def _run_research_background(stream_id: int, answers: dict, chat_id: int,
 
         store.update_stream_status(stream_id, "active")
 
-        # Report results
-        final_sources = state.get("final_sources", [])
-        profile = state.get("profile", {})
+        # Report from what was actually STORED, not just the fetchable subset.
+        # Qualification can find great sources that validation can't reach on the
+        # first try (they rate-limit us right after the qualification crawl). Those
+        # are stored 'blocked' and the daily health check revives them — so
+        # "found nothing" is only true when qualification itself came up empty.
+        stream = store.get_stream(stream_id)
+        stream_name = (stream or {}).get("name", "your stream")
+        stored = store.get_sources_by_stream(stream_id)
+        active = [s for s in stored if s["fetch_status"] == "active"]
+        blocked = [s for s in stored if s["fetch_status"] == "blocked"]
 
-        if final_sources:
-            markdown = f"""\
-# ✅ Found {len(final_sources)} sources for you
+        if active or blocked:
+            lines = [f"# ✅ Found {len(stored)} sources for you", "",
+                     f"Here's what I'll be watching for **{stream_name}**:", "",
+                     "| # | Source | Match | Status |",
+                     "|---|--------|-------|--------|"]
+            for i, src in enumerate(active + blocked, 1):
+                name = (src.get("name") or src["url"])[:25]
+                score = src.get("quality_score", 0)
+                icon = "✅" if src["fetch_status"] == "active" else "🔄"
+                lines.append(f"| {i} | {name} | {score}/100 | {icon} |")
 
-Here's what I'll be watching for **{stream_name}**:
-
-| # | Source | Match | Status |
-|---|--------|-------|--------|
-"""
-            for i, src in enumerate(final_sources, 1):
-                name = src.get('name', 'Unknown')[:25]
-                score = src.get('quality_score', 0)
-                markdown += f"| {i} | {name} | {score}/100 | ✅ |\n"
-
-            markdown += (
-                f"\nI'll start pulling relevant stories from these shortly.\n\n"
-                f"Want to fine-tune? `/sources {stream_id}` shows the full list — "
-                f"you can drop any with `/deletesource <id>` or add your own with "
+            if active:
+                lines.append("\nI'll start pulling relevant stories from these shortly.")
+            if blocked:
+                lines.append(
+                    f"\n🔄 {len(blocked)} were busy when I checked — I'll keep "
+                    f"retrying them automatically and they'll switch on once reachable."
+                )
+            lines.append(
+                f"\nWant to fine-tune? `/sources {stream_id}` shows the full list — "
+                f"drop any with `/deletesource <id>` or add your own with "
                 f"`/addsource {stream_id} <url>`."
             )
-
-            await send_rich_async(chat_id, markdown)
+            await send_rich_async(chat_id, "\n".join(lines))
         else:
             await send_rich_async(chat_id, f"""\
 I dug through a lot of sites but couldn't find sources solid enough to trust for this one yet — often that means the topic is very narrow, or worth phrasing a little differently.

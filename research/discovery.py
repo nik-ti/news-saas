@@ -136,10 +136,15 @@ async def search_parallel(queries: list[str]) -> list[str]:
 
 
 # Skip social media, aggregators, etc. — matched as exact domain or subdomain
+# Domains with nothing pollable as an HTML news list — pure social feeds, app
+# stores, search engines, shopping. Medium is deliberately NOT here: it's a real
+# article host where good niche writers publish, and it crawls fine. Reddit and
+# aggregators like Google News aren't here either, but they're handled through a
+# dedicated RSS path (generic discovery would only find their useless root URL).
 SKIP_DOMAINS = {
     "facebook.com", "twitter.com", "x.com", "instagram.com",
     "linkedin.com", "youtube.com", "tiktok.com", "reddit.com",
-    "wikipedia.org", "google.com", "bing.com", "medium.com",
+    "wikipedia.org", "google.com", "bing.com",
     "amazon.com", "play.google.com", "apps.apple.com",
     "quora.com", "pinterest.com", "github.com",
 }

@@ -18,9 +18,9 @@ async def validate_source(url: str) -> dict:
     """
     # RSS/Atom feeds: validate with the direct feed parser — the browser
     # crawler can false-flag raw XML as "blocked" (minimal visible text)
-    from pipeline.fetch_news import RSS_URL_HINTS, _fetch_rss_items
+    from pipeline.fetch_news import RSS_URL_HINTS, fetch_rss_items
     if any(h in url.lower() for h in RSS_URL_HINTS):
-        items = await _fetch_rss_items(url)
+        items = await fetch_rss_items(url)
         if items:
             logger.info("Validation: %s → active (RSS feed, %d items)", url, len(items))
             return {
@@ -47,24 +47,47 @@ async def validate_source(url: str) -> dict:
     }
 
 
-async def validate_sources(urls: list[str]) -> list[dict]:
-    """Validate multiple sources in parallel."""
-    import asyncio
-    tasks = [validate_source(url) for url in urls]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+def _failed(url: str, error: str) -> dict:
+    return {"url": url, "fetchable": False, "title": "", "content_preview": "",
+            "status": "blocked", "error": error}
 
-    final = []
-    for url, result in zip(urls, results):
+
+async def validate_sources(urls: list[str]) -> list[dict]:
+    """
+    Validate multiple sources, then give every failure a second, unhurried try.
+
+    Validation runs immediately after qualification has hammered these same
+    hosts with dozens of parallel crawls. A source that fails here is usually
+    rate-limited, not broken — and condemning it means the user never sees that
+    publication again. So failures are retried one at a time, with a pause.
+    """
+    import asyncio
+
+    results = await asyncio.gather(*(validate_source(u) for u in urls),
+                                   return_exceptions=True)
+
+    final: list[dict] = []
+    retry: list[int] = []
+    for i, (url, result) in enumerate(zip(urls, results)):
         if isinstance(result, Exception):
-            final.append({
-                "url": url,
-                "fetchable": False,
-                "title": "",
-                "content_preview": "",
-                "status": "error",
-                "error": str(result),
-            })
+            final.append(_failed(url, str(result)))
+            retry.append(i)
         else:
             final.append(result)
+            if not result["fetchable"]:
+                retry.append(i)
+
+    if retry:
+        logger.info("Validation: retrying %d failed source(s) sequentially", len(retry))
+    for i in retry:
+        await asyncio.sleep(1.5)
+        try:
+            second = await validate_source(urls[i])
+        except Exception as e:
+            logger.warning("Validation retry crashed for %s: %s", urls[i], e)
+            continue
+        if second["fetchable"]:
+            logger.info("Validation: %s passed on retry", urls[i])
+            final[i] = second
 
     return final
