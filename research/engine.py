@@ -369,6 +369,50 @@ async def run_research(answers: dict, stream_id: int,
                 store.add_source(stream_id=stream_id,
                                  **_to_source_dict(q, fetch_status="blocked"))
 
+    # Always give the stream a Google News feed for its topic — an aggregator
+    # across every publication, on-topic by construction. Per-article relevance
+    # and caps keep it in check.
+    await _add_google_news_source(stream_id, state.get("profile", {}), progress)
+
     logger.info("Research complete: %d sources stored for stream %d",
                 len(state["final_sources"]), stream_id)
     return state
+
+
+async def _add_google_news_source(stream_id: int, profile: dict,
+                                   progress: ProgressCallback = None) -> None:
+    """Attach a verified Google News topic feed to the stream (idempotent)."""
+    from research.aggregators import google_news_feed_url, news_query_for
+    from pipeline.fetch_news import fetch_rss_items
+
+    if not profile:
+        return
+    query = news_query_for(profile)
+    feed_url = google_news_feed_url(query)
+
+    # Key on a stable site URL so re-research doesn't add duplicates.
+    site_url = f"https://news.google.com/search?q={query}"
+    if store.get_source_by_url(stream_id, site_url):
+        return
+
+    items = await fetch_rss_items(feed_url)
+    if not items:
+        logger.info("Google News feed empty for %r — skipping", query)
+        return
+
+    store.add_source(
+        stream_id=stream_id,
+        url=site_url,
+        name=f"Google News: {query}"[:100],
+        broad_category=profile.get("broad_domain", ""),
+        site_type="aggregator",
+        description=(f"Google News aggregator feed for '{query}'. Pulls the latest "
+                     f"matching headlines from across many publications."),
+        feed_url=feed_url,
+        fetch_method="rss",
+        fetch_status="active",
+        quality_score=60,
+    )
+    if progress:
+        await progress(f"📰 Added a Google News feed for **{query}**")
+    logger.info("Added Google News source for stream %d (%r)", stream_id, query)

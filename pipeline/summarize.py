@@ -36,8 +36,17 @@ async def summarize_article(article: dict) -> tuple[str, str]:
     `title` may be corrected from the page's own <title> — link text on feed
     pages is often card text (category + date + headline + snippet concatenated).
     """
+    from research.aggregators import is_google_news_url
+
     title = (article.get("title") or "").strip()
     url = article.get("url", "")
+
+    # Google News items are headline-only: the URL is a redirect to an
+    # interstitial (not the article), and the RSS snippet is just a link. The
+    # title — "Headline - Publication" — is all we have and all we need. The
+    # relevance gate and a compact post both work fine off the headline.
+    if is_google_news_url(url):
+        return (title or SKIP), title
 
     # Inline-extracted items (changelog-style sources) already carry a summary,
     # and their url points at the feed page, so re-fetching would be wrong.
