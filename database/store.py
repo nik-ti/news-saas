@@ -426,6 +426,59 @@ def get_latest_articles(limit: int = 20) -> list[dict]:
 
 # ── Internal Source DB (cross-stream) ────────────────────────────────────────
 
+def set_source_embedding(source_id: int, blob: bytes) -> None:
+    conn = get_connection()
+    conn.execute("UPDATE sources SET embedding = ? WHERE id = ?", (blob, source_id))
+    conn.commit()
+    conn.close()
+
+
+def sources_missing_embedding(stream_id: int = None) -> list[dict]:
+    """Sources with no embedding yet (optionally scoped to one stream)."""
+    conn = get_connection()
+    sql = "SELECT * FROM sources WHERE embedding IS NULL"
+    args = ()
+    if stream_id is not None:
+        sql += " AND stream_id = ?"
+        args = (stream_id,)
+    rows = conn.execute(sql, args).fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        d = dict(row)
+        d["specific_keywords"] = json.loads(d.get("specific_keywords") or "[]")
+        results.append(d)
+    return results
+
+
+def get_embedded_sources(exclude_stream_id: int = None) -> list[dict]:
+    """
+    Every source that has an embedding, one row per distinct feed page (the
+    internal DB is cross-stream). Optionally exclude the stream we're building,
+    so research doesn't 'reuse' the sources it just added.
+    """
+    conn = get_connection()
+    sql = (
+        "SELECT id, url, name, broad_category, site_type, specific_keywords, "
+        "description, feed_url, fetch_method, quality_score, embedding, "
+        "MIN(stream_id) AS stream_id "
+        "FROM sources WHERE embedding IS NOT NULL AND fetch_status = 'active'"
+    )
+    args = ()
+    if exclude_stream_id is not None:
+        sql += " AND stream_id != ?"
+        args = (exclude_stream_id,)
+    sql += " GROUP BY feed_url"   # dedupe the same page discovered for many users
+    rows = conn.execute(sql, args).fetchall()
+    conn.close()
+    results = []
+    for row in rows:
+        d = dict(row)
+        d["specific_keywords"] = json.loads(d.get("specific_keywords") or "[]")
+        results.append(d)
+    return results
+
+
 def find_internal_sources(broad_category: str, keywords: list) -> list[dict]:
     """Find existing sources in DB matching a broad category + any keyword."""
     conn = get_connection()

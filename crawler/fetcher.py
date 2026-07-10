@@ -29,6 +29,8 @@ async def _get_crawler():
             text_mode=True,          # disable images/media for speed + memory
             light_mode=True,         # minimal browser setup
             memory_saving_mode=True, # aggressive memory optimization
+            enable_stealth=True,     # patch the automation fingerprints bot-walls look for
+            user_agent_mode="random",  # rotate a realistic UA instead of HeadlessChrome
         )
         crawler = AsyncWebCrawler(config=browser_config)
         try:

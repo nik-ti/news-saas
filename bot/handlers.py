@@ -483,6 +483,13 @@ async def _store_discovered_source(chat_id: int, stream_id: int, site_url: str,
     )
     kind = "RSS feed" if cand.kind == "feed" else "article page"
 
+    # Add it to the semantic internal DB too (best-effort).
+    try:
+        from research import embeddings
+        await embeddings.backfill_stream_embeddings(stream_id)
+    except Exception:
+        logger.exception("Embedding a manually-added source failed (non-fatal)")
+
     await send_rich_async(chat_id, f"""\
 ✅ **Source added** — `{source_id}`
 

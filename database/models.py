@@ -47,6 +47,7 @@ def init_db() -> None:
         fetch_status    TEXT    DEFAULT 'active',  -- active | blocked | error
         feed_url        TEXT,
         fetch_method    TEXT,            -- rss | links | inline — the proven way to read this source
+        embedding       BLOB,            -- float32 vector of what this source covers (semantic reuse)
         fail_count      INTEGER DEFAULT 0,
         last_checked    TEXT,
         last_fetched    TEXT,
@@ -83,6 +84,7 @@ def init_db() -> None:
             ("baselined_at", "ALTER TABLE sources ADD COLUMN baselined_at TEXT"),
             ("site_type", "ALTER TABLE sources ADD COLUMN site_type TEXT"),
             ("fetch_method", "ALTER TABLE sources ADD COLUMN fetch_method TEXT"),
+            ("embedding", "ALTER TABLE sources ADD COLUMN embedding BLOB"),
         ],
         "articles": [
             ("posted_at", "ALTER TABLE articles ADD COLUMN posted_at TEXT"),

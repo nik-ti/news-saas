@@ -103,19 +103,30 @@ async def node_build_profile(state: ResearchState,
 
 async def node_check_db(state: ResearchState,
                          progress: ProgressCallback = None) -> ResearchState:
-    """Check internal DB for existing sources matching this profile."""
+    """
+    Check the internal DB for sources that already cover this topic — by MEANING,
+    so 'EU crypto regulation' finds a source tagged 'European digital-asset law'.
+    Matches are seeds; they still go through qualification for this user.
+    """
     progress = progress or _noop
     state["log"].append("Phase 2: Checking internal DB")
 
     profile = state["profile"]
-    db_matches = store.find_internal_sources(
-        broad_category=profile.get("broad_domain", ""),
-        keywords=profile.get("keywords", []),
+    from research import embeddings
+    db_matches = await embeddings.find_internal_semantic(
+        profile, exclude_stream_id=state.get("stream_id")
     )
-    state["db_matches"] = db_matches
 
+    # Fall back to the old literal match if embeddings are unavailable.
+    if not db_matches:
+        db_matches = store.find_internal_sources(
+            broad_category=profile.get("broad_domain", ""),
+            keywords=profile.get("keywords", []),
+        )
+
+    state["db_matches"] = db_matches
     if db_matches:
-        await progress(f"🗄️ Found {len(db_matches)} existing source(s) in internal DB")
+        await progress(f"🗄️ Reusing {len(db_matches)} known source(s) from past research")
 
     return state
 
@@ -373,6 +384,13 @@ async def run_research(answers: dict, stream_id: int,
     # across every publication, on-topic by construction. Per-article relevance
     # and caps keep it in check.
     await _add_google_news_source(stream_id, state.get("profile", {}), progress)
+
+    # Embed the sources we just stored so future research can find them by meaning.
+    try:
+        from research import embeddings
+        await embeddings.backfill_stream_embeddings(stream_id)
+    except Exception:
+        logger.exception("Embedding backfill failed (non-fatal)")
 
     logger.info("Research complete: %d sources stored for stream %d",
                 len(state["final_sources"]), stream_id)

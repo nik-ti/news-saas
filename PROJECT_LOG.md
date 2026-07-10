@@ -130,6 +130,24 @@ longer be retried forever, nor silently discarded by a transient LLM outage; `fe
 longer returns `title=None`; streams stranded in `researching` by a restart are reconciled on boot;
 speculative feed probing no longer trips Cloudflare and locks the crawler out.
 
+### Jul 10, 2026 (later) — Semantic source DB, aggregators, post length, stealth
+
+- **Semantic internal source DB.** Every qualified source is embedded
+  (OpenRouter `text-embedding-3-small`, 1536-dim, stored as a BLOB). New research
+  does a cosine-similarity lookup of the internal DB first, so "EU crypto
+  regulation" reuses a source tagged "European digital-asset law" — no shared
+  words needed. Matches are seeds; they still re-qualify for the new user.
+  (`research/embeddings.py`.)
+- **Google News aggregator feeds** per stream (`research/aggregators.py`),
+  handled as headline items (their links are redirects, not articles).
+- **Richer source metadata**: `site_type`, meaningful descriptions, stored
+  `fetch_method` so the poller doesn't re-guess each cycle.
+- **Post length** per stream (Standard ~100 words / Compact) via `/postsize`.
+- **Crawler stealth mode** (`enable_stealth=True`, random UA) to get past bot
+  walls — openai.com now returns real content instead of a Cloudflare block.
+- **Research reporting** no longer says "found nothing" when sources were stored
+  but temporarily unreachable; validation retries rate-limited hosts.
+
 ---
 
 ## Tech Stack

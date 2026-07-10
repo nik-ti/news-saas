@@ -63,6 +63,27 @@ def get_llm_post() -> ChatOpenAI:
     return _llm_post
 
 
+async def _openrouter_embeddings(model: str, inputs: list[str]) -> list[list[float]]:
+    """
+    Call OpenRouter's /embeddings endpoint directly (langchain's chat client
+    doesn't cover embeddings). Returns one vector per input, in order.
+    """
+    import httpx
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{config.OPENROUTER_BASE_URL}/embeddings",
+            headers={"Authorization": f"Bearer {config.OPENROUTER_API_KEY}"},
+            json={"model": model, "input": inputs},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    # Preserve request order (OpenAI-compatible responses carry an index).
+    rows = sorted(data["data"], key=lambda d: d.get("index", 0))
+    return [row["embedding"] for row in rows]
+
+
 async def chat(system_prompt: str, user_prompt: str, smart: bool = False) -> str:
     """
     Simple async chat call. Returns the text response.
