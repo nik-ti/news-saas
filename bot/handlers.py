@@ -18,23 +18,18 @@ from telegram.ext import (
 import config
 from database import store
 from database.models import init_db, get_connection
-from bot.messaging import send_rich_async, send_rich_html_async
-from bot.keyboards import (
-    stream_management_keyboard,
-    source_management_keyboard,
-    main_menu_keyboard,
-)
+from bot.messaging import send_rich_async
 from research.engine import run_research
-from research.profile_builder import generate_followup_questions, PREMADE_QUESTIONS
+from research.feed_finder import find_news_pages
+from research.profile_builder import interview_turn, OPENER
 from crawler.fetcher import test_source
-from pipeline.fetch_news import fetch_all_news
-from pipeline.summarize import process_new_articles
-from pipeline.deliver import deliver_digest_async
+from pipeline.news_cycle import run_news_cycle
 
 logger = logging.getLogger(__name__)
 
-# ── Conversation states for /newstream ───────────────────────────────────────
-TOPIC, STRICTNESS, EXCLUSIONS, FOLLOWUPS, RESEARCHING = range(5)
+# ── Conversation state for /newstream ─────────────────────────────────────────
+# A single natural interview loop replaces the old fixed-form states.
+INTERVIEW = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -55,7 +50,7 @@ deliver relevant news directly to you.
 
 | Command | Description |
 |---------|-------------|
-| `/newstream` | Create a new news stream (guided Q&A) |
+| `/newstream` | Set up a new news stream (just tell me what you want) |
 | `/streams` | List all your news streams |
 | `/sources <stream_id>` | View sources for a stream |
 | `/sources_all` | View the entire source database |
@@ -77,139 +72,66 @@ deliver relevant news directly to you.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_newstream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start the new stream conversation."""
-    context.user_data["answers"] = {}
-    context.user_data["premade_idx"] = 0
+    """Start the natural intake conversation."""
+    context.user_data["transcript"] = [{"role": "assistant", "content": OPENER}]
 
-    await send_rich_async(update.effective_chat.id, """\
-# ➕ New News Stream
-
-Let's set up your personalised news feed. I'll ask a few questions, \
-then our AI research engine will find the best sources for you.
-
----
-""")
-
-    # Ask the first premade question
-    q = PREMADE_QUESTIONS[0]
-    await send_rich_async(
-        update.effective_chat.id,
-        f"**Q1: {q['question']}**\n\n_{q['placeholder']}_",
-    )
-    return TOPIC
+    await send_rich_async(update.effective_chat.id, OPENER)
+    return INTERVIEW
 
 
-async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle the topic answer, ask about strictness."""
-    context.user_data["answers"]["topic"] = update.message.text
-    context.user_data["premade_idx"] = 1
+async def handle_interview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    One turn of the natural intake conversation.
+    The interviewer decides whether to ask another question or start research.
+    """
+    transcript = context.user_data.setdefault("transcript", [])
+    transcript.append({"role": "user", "content": update.message.text})
 
-    q = PREMADE_QUESTIONS[1]
-    await send_rich_async(
-        update.effective_chat.id,
-        f"Got it.\n\n**Q2: {q['question']}**\n\n_{q['placeholder']}_",
-    )
-    return STRICTNESS
+    # Show a genuine "typing…" indicator instead of mechanical status text.
+    await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
+    turn = await interview_turn(transcript)
+    transcript.append({"role": "assistant", "content": turn["message"]})
 
-async def handle_strictness(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle the strictness answer, ask about exclusions."""
-    context.user_data["answers"]["strictness"] = update.message.text
-    context.user_data["premade_idx"] = 2
+    await send_rich_async(update.effective_chat.id, turn["message"])
 
-    q = PREMADE_QUESTIONS[2]
-    await send_rich_async(
-        update.effective_chat.id,
-        f"**Q3: {q['question']}**\n\n_{q['placeholder']}_",
-    )
-    return EXCLUSIONS
+    if not turn["enough"]:
+        return INTERVIEW
 
-
-async def handle_exclusions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle exclusions, generate dynamic follow-up questions."""
-    context.user_data["answers"]["exclusions"] = update.message.text
-
-    await send_rich_async(update.effective_chat.id, "🧠 Generating follow-up questions...")
-
-    # Generate dynamic follow-ups
-    followups = await generate_followup_questions(context.user_data["answers"])
-    context.user_data["followup_questions"] = followups
-    context.user_data["followup_answers"] = []
-    context.user_data["followup_idx"] = 0
-
-    if followups:
-        await send_rich_async(
-            update.effective_chat.id,
-            f"**Follow-up: {followups[0]}**",
-        )
-        return FOLLOWUPS
-    else:
-        # No follow-ups needed, proceed to research
-        return await _start_research(update, context)
-
-
-async def handle_followups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle follow-up question answers."""
-    context.user_data["followup_answers"].append(update.message.text)
-    context.user_data["followup_idx"] += 1
-
-    followups = context.user_data["followup_questions"]
-    idx = context.user_data["followup_idx"]
-
-    if idx < len(followups):
-        await send_rich_async(
-            update.effective_chat.id,
-            f"**Follow-up: {followups[idx]}**",
-        )
-        return FOLLOWUPS
-    else:
-        # All follow-ups answered, compile answers and start research
-        return await _start_research(update, context)
+    return await _start_research(update, context)
 
 
 async def _start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Compile answers and kick off research."""
-    # Merge follow-up answers into the answers dict
-    answers = context.user_data["answers"]
-    followup_qs = context.user_data.get("followup_questions", [])
-    followup_as = context.user_data.get("followup_answers", [])
-    for q, a in zip(followup_qs, followup_as):
-        answers[f"followup_{len(answers)}"] = f"Q: {q}\nA: {a}"
+    """Compile the conversation and kick off research."""
+    transcript = context.user_data.get("transcript", [])
 
-    # Create stream in DB
-    stream_name = answers.get("topic", "New Stream")[:50]
+    # Seed the stream name from the user's first answer; hand the full
+    # conversation to the research engine as the criteria.
+    first_answer = next(
+        (t["content"] for t in transcript if t["role"] == "user"), "New Stream"
+    )
+    convo_text = "\n".join(
+        f"{'User' if t['role'] == 'user' else 'Service'}: {t['content']}"
+        for t in transcript
+    )
+    answers = {"topic": first_answer, "conversation": convo_text}
+
+    stream_name = first_answer[:50]
     stream_id = store.create_stream(
         user_id=update.effective_user.id,
         name=stream_name,
-        criteria=answers,  # temporary, will be replaced with profile after research
+        criteria=answers,  # temporary, replaced with the profile after research
     )
     store.update_stream_status(stream_id, "researching")
     context.user_data["stream_id"] = stream_id
 
     await send_rich_async(update.effective_chat.id, f"""\
-# 🔬 Research Starting
+🔎 On it — I'm reading through the best sources on this now.
 
-**Stream:** {stream_name}
-**Stream ID:** `{stream_id}`
-
-The research engine is now running:
-1. Build criteria profile
-2. Search for candidates (parallel)
-3. Qualify sources (parallel sub-agents)
-4. Validate fetchability
-
-This usually takes 30-90 seconds. I'll keep you updated.
-
----\
+This usually takes a minute or two. I'll send them over as soon as they're ready.\
 """)
 
-    # Run research in background with progress callbacks
     chat_id = update.effective_chat.id
-
-    async def progress(msg: str):
-        await send_rich_async(chat_id, msg)
-
-    # Run research asynchronously
     asyncio.create_task(_run_research_background(stream_id, answers, chat_id, context))
 
     return ConversationHandler.END
@@ -240,34 +162,33 @@ async def _run_research_background(stream_id: int, answers: dict, chat_id: int,
 
         if final_sources:
             markdown = f"""\
-# ✅ Research Complete!
+# ✅ Found {len(final_sources)} sources for you
 
-**Stream ID:** `{stream_id}`
-**Domain:** {profile.get('broad_domain', 'N/A')}
-**Sources Found:** {len(final_sources)}
+Here's what I'll be watching for **{stream_name}**:
 
-## Top Sources
-
-| # | Source | Score | Status |
+| # | Source | Match | Status |
 |---|--------|-------|--------|
 """
             for i, src in enumerate(final_sources, 1):
                 name = src.get('name', 'Unknown')[:25]
                 score = src.get('quality_score', 0)
-                markdown += f"| {i} | {name} | {score} | ✅ |\n"
+                markdown += f"| {i} | {name} | {score}/100 | ✅ |\n"
 
-            markdown += f"\nUse `/sources {stream_id}` to see full details."
+            markdown += (
+                f"\nI'll start pulling relevant stories from these shortly.\n\n"
+                f"Want to fine-tune? `/sources {stream_id}` shows the full list — "
+                f"you can drop any with `/deletesource <id>` or add your own with "
+                f"`/addsource {stream_id} <url>`."
+            )
 
             await send_rich_async(chat_id, markdown)
         else:
             await send_rich_async(chat_id, f"""\
-# ⚠️ Research Complete (No Sources)
+I dug through a lot of sites but couldn't find sources solid enough to trust for this one yet — often that means the topic is very narrow, or worth phrasing a little differently.
 
-The research engine didn't find enough qualifying sources. \
-This can happen with very narrow topics.
-
-Try `/research {stream_id}` to try again, or `/addsource {stream_id} <url>` \
-to add a source manually.
+A couple of options:
+• `/research {stream_id}` — I'll take another pass at it.
+• `/addsource {stream_id} <url>` — point me at a site you already like and I'll build from there.\
 """)
 
     except Exception as e:
@@ -332,33 +253,40 @@ async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await send_rich_async(update.effective_chat.id, f"📭 No sources found for stream `{stream_id}`.")
         return
 
-    # Build rich source table
+    # The ID column IS the id you pass to /deletesource — never a row number.
     markdown = f"# 📰 Sources for Stream `{stream_id}`\n\n"
-    markdown += "| # | Source | Score | Status | Keywords |\n|---|--------|-------|--------|----------|\n"
+    markdown += "| ID | Source | Score | Status |\n|----|--------|-------|--------|\n"
 
-    for i, src in enumerate(sources, 1):
-        name = (src.get("name") or src["url"])[:25]
+    for src in sources:
+        name = (src.get("name") or src["url"])[:28]
         score = src.get("quality_score", 0)
         status_icon = {"active": "✅", "blocked": "🚫", "error": "⚠️"}.get(src["fetch_status"], "❓")
-        keywords = ", ".join(src.get("specific_keywords", [])[:3])
-        markdown += f"| {i} | [{name}]({src['url']}) | {score} | {status_icon} | {keywords} |\n"
+        markdown += f"| `{src['id']}` | [{name}]({src['url']}) | {score} | {status_icon} |\n"
 
-    # Collapsible details for each source
-    detail_parts = ["\n---\n## Source Details\n"]
-    for i, src in enumerate(sources, 1):
-        detail_parts.append(f"\n**{i}. {src.get('name', src['url'])}**")
-        detail_parts.append(f"- URL: {src['url']}")
-        detail_parts.append(f"- Score: {src.get('quality_score', 0)}/100")
-        detail_parts.append(f"- Status: {src['fetch_status']}")
-        detail_parts.append(f"- Category: {src.get('broad_category', 'N/A')}")
-        detail_parts.append(f"- Keywords: {', '.join(src.get('specific_keywords', []))}")
+    detail_parts = ["\n---\n## Details\n"]
+    for src in sources:
+        detail_parts.append(f"\n**`{src['id']}` — {src.get('name') or src['url']}**")
+        detail_parts.append(f"- Site: {src['url']}")
+        if src.get("feed_url") and src["feed_url"] != src["url"]:
+            detail_parts.append(f"- Polling: {src['feed_url']}")
+        detail_parts.append(f"- Score: {src.get('quality_score', 0)}/100 · Status: {src['fetch_status']}")
+        if src.get("specific_keywords"):
+            detail_parts.append(f"- Keywords: {', '.join(src['specific_keywords'])}")
         if src.get("description"):
-            detail_parts.append(f"- Description: {src['description']}")
-        detail_parts.append(f"- ID: `{src['id']}` (use with /deletesource)")
+            detail_parts.append(f"- {src['description']}")
 
     markdown += "\n".join(detail_parts)
+    markdown += "\n\n_Delete with_ `/deletesource <ID>` _— or tap below._"
 
     await send_rich_async(update.effective_chat.id, markdown)
+
+    rows = [[InlineKeyboardButton(
+        f"🗑 {src['id']} · {_short(src.get('name') or src['url'], 26)}",
+        callback_data=f"del_src:{src['id']}")] for src in sources[:10]]
+    await context.bot.send_message(
+        update.effective_chat.id, "Tap a source to delete it:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -393,62 +321,124 @@ async def cmd_sources_all(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # COMMAND: /addsource <stream_id> <url>
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _owns_stream(user_id: int, stream_id: int) -> tuple[bool, dict | None]:
+    stream = store.get_stream(stream_id)
+    if not stream:
+        return False, None
+    return stream["user_id"] == user_id, stream
+
+
 async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manually add a source."""
+    """
+    Add a source. The user usually pastes a site's front door, so we go and find
+    the page that actually lists its articles rather than polling a homepage.
+    """
+    chat_id = update.effective_chat.id
+
     if len(context.args) < 2:
-        await send_rich_async(update.effective_chat.id, "Usage: `/addsource <stream_id> <url>`")
+        await send_rich_async(chat_id, "Usage: `/addsource <stream_id> <url>`")
         return
 
     try:
         stream_id = int(context.args[0])
     except ValueError:
-        await send_rich_async(update.effective_chat.id, "Invalid stream ID.")
+        await send_rich_async(chat_id, "Invalid stream ID.")
+        return
+
+    owns, stream = await _owns_stream(update.effective_user.id, stream_id)
+    if stream is None:
+        await send_rich_async(chat_id, f"❌ Stream `{stream_id}` not found.")
+        return
+    if not owns:
+        await send_rich_async(chat_id, "❌ That stream isn't yours.")
         return
 
     url = context.args[1]
+    if "://" not in url:
+        url = f"https://{url}"
 
-    # Check if source already exists
-    existing = store.get_source_by_url(stream_id, url)
-    if existing:
-        await send_rich_async(update.effective_chat.id, f"⚠️ Source already exists: `{existing['id']}`")
+    await send_rich_async(
+        chat_id,
+        f"🔍 Looking for the news page on `{url}`...\n\n_Checking for feeds, "
+        f"section pages, and site navigation. This takes a moment._",
+    )
+
+    try:
+        candidates = await find_news_pages(url)
+    except Exception as e:
+        logger.exception("Feed discovery failed for %s", url)
+        await send_rich_async(chat_id, f"❌ Couldn't inspect that site: {e}")
         return
 
-    await send_rich_async(update.effective_chat.id, f"🧪 Testing `{url}` with web crawler...")
-
-    # Test the source
-    result = await test_source(url)
-
-    if result["fetchable"]:
-        source_id = store.add_source(
-            stream_id=stream_id,
-            url=url,
-            name=result["title"][:100],
-            fetch_status="active",
+    # ── Nothing publishable ───────────────────────────────────────────
+    if not candidates:
+        context.user_data["pending_source"] = {"stream_id": stream_id, "url": url}
+        await context.bot.send_message(
+            chat_id,
+            f"I crawled <b>{url}</b> — its feeds, common news paths, and its own "
+            f"navigation — and couldn't find any page that lists articles.\n\n"
+            f"That usually means the site doesn't publish a news feed, or it "
+            f"blocks crawlers.\n\nAdd it anyway and poll the URL as given?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("➕ Add anyway", callback_data="feed:force"),
+                InlineKeyboardButton("✖️ Cancel", callback_data="feed:cancel"),
+            ]]),
         )
-        await send_rich_async(update.effective_chat.id, f"""\
-✅ Source added successfully!
+        return
 
-**ID:** `{source_id}`
-**URL:** {url}
-**Title:** {result['title']}
+    # ── Exactly one → just add it ─────────────────────────────────────
+    if len(candidates) == 1:
+        await _store_discovered_source(chat_id, stream_id, url, candidates[0])
+        return
 
-The crawler can fetch this source. News will be included in future fetches.\
-""")
-    else:
-        # Add as blocked so the user can see it
-        source_id = store.add_source(
-            stream_id=stream_id,
-            url=url,
-            fetch_status="blocked",
-        )
-        await send_rich_async(update.effective_chat.id, f"""\
-⚠️ Source added but **blocked**.
+    # ── Several → let the user choose ─────────────────────────────────
+    context.user_data["feed_candidates"] = {
+        "stream_id": stream_id, "site_url": url,
+        "cands": [(c.url, c.kind, c.item_count) for c in candidates],
+    }
+    rows = [[InlineKeyboardButton(
+        f"{'📡' if c.kind == 'feed' else '📄'} {_short(c.url)} · {c.item_count} articles",
+        callback_data=f"feed:{i}")] for i, c in enumerate(candidates)]
+    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="feed:cancel")])
 
-**ID:** `{source_id}`
-**URL:** {url}
-**Error:** {result.get('error', 'Unknown')}
+    await context.bot.send_message(
+        chat_id,
+        f"<b>{url}</b> has more than one page that publishes articles.\n\n"
+        f"Which should I follow?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
-The crawler couldn't fetch this source. It's saved as blocked for reference.\
+
+def _short(url: str, n: int = 34) -> str:
+    trimmed = url.replace("https://", "").replace("http://", "").rstrip("/")
+    return trimmed if len(trimmed) <= n else trimmed[: n - 1] + "…"
+
+
+async def _store_discovered_source(chat_id: int, stream_id: int, site_url: str,
+                                   cand) -> None:
+    """Persist a verified news page as a source, keyed on the site's root URL."""
+    if store.get_source_by_url(stream_id, site_url):
+        await send_rich_async(chat_id, "⚠️ That source is already on this stream.")
+        return
+
+    name = (cand.title or _short(site_url, 60))[:100]
+    source_id = store.add_source(
+        stream_id=stream_id, url=site_url, name=name,
+        feed_url=cand.url, fetch_status="active",
+    )
+    kind = "RSS feed" if cand.kind == "feed" else "article page"
+
+    await send_rich_async(chat_id, f"""\
+✅ **Source added** — `{source_id}`
+
+**Site:** {site_url}
+**Polling:** {cand.url}
+_Found via {kind} — {cand.item_count} articles detected._
+
+I'll baseline it on the next cycle: everything published so far is recorded \
+silently, and you'll only hear about what appears *after* that.\
 """)
 
 
@@ -456,10 +446,28 @@ The crawler couldn't fetch this source. It's saved as blocked for reference.\
 # COMMAND: /deletesource <source_id>
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _delete_source_for(user_id: int, source_id: int) -> tuple[bool, str]:
+    """Delete a source if the caller owns its stream. Returns (ok, message)."""
+    src = store.get_source(source_id)
+    if not src:
+        return False, (f"❌ No source with ID `{source_id}`.\n\n"
+                       f"Use `/sources <stream_id>` — the **ID** column is what "
+                       f"you pass here, not the row position.")
+
+    owns, _ = await _owns_stream(user_id, src["stream_id"])
+    if not owns:
+        return False, "❌ That source belongs to someone else's stream."
+
+    store.delete_source(source_id)
+    name = src.get("name") or src["url"]
+    return True, f"🗑️ Deleted source `{source_id}` — {name}"
+
+
 async def cmd_deletesource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Delete a source."""
+    """Delete a source by its database ID."""
     if not context.args:
-        await send_rich_async(update.effective_chat.id, "Usage: `/deletesource <source_id>`")
+        await send_rich_async(update.effective_chat.id,
+                              "Usage: `/deletesource <source_id>`")
         return
 
     try:
@@ -468,13 +476,94 @@ async def cmd_deletesource(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await send_rich_async(update.effective_chat.id, "Invalid source ID.")
         return
 
-    src = store.get_source(source_id)
-    if not src:
-        await send_rich_async(update.effective_chat.id, "❌ Source not found.")
+    _, msg = await _delete_source_for(update.effective_user.id, source_id)
+    await send_rich_async(update.effective_chat.id, msg)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Inline button callbacks
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route every inline-keyboard press. Without this, all buttons are dead."""
+    query = update.callback_query
+    await query.answer()  # stop Telegram's spinner
+
+    data = query.data or ""
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+
+    # ── Delete a source ───────────────────────────────────────────────
+    if data.startswith("del_src:"):
+        source_id = int(data.split(":", 1)[1])
+        ok, msg = await _delete_source_for(user_id, source_id)
+        await query.edit_message_text(
+            ("🗑️ Deleted." if ok else "Couldn't delete that one."))
+        await send_rich_async(chat_id, msg)
         return
 
-    store.delete_source(source_id)
-    await send_rich_async(update.effective_chat.id, f"🗑️ Deleted source `{source_id}` ({src.get('name', src['url'])})")
+    # ── Re-test a source ──────────────────────────────────────────────
+    if data.startswith("test_src:"):
+        source_id = int(data.split(":", 1)[1])
+        src = store.get_source(source_id)
+        if not src:
+            await send_rich_async(chat_id, "❌ Source not found.")
+            return
+        result = await test_source(src.get("feed_url") or src["url"])
+        if result["fetchable"]:
+            store.reactivate_source(source_id)
+            await send_rich_async(chat_id, f"✅ `{source_id}` is reachable — reactivated.")
+        else:
+            await send_rich_async(chat_id,
+                                  f"❌ `{source_id}` still unreachable: {result.get('error')}")
+        return
+
+    # ── Feed discovery choices ────────────────────────────────────────
+    if data == "feed:cancel":
+        context.user_data.pop("feed_candidates", None)
+        context.user_data.pop("pending_source", None)
+        await query.edit_message_text("Cancelled — nothing was added.")
+        return
+
+    if data == "feed:force":
+        pending = context.user_data.pop("pending_source", None)
+        if not pending:
+            await query.edit_message_text("That request expired. Run /addsource again.")
+            return
+        source_id = store.add_source(
+            stream_id=pending["stream_id"], url=pending["url"],
+            name=_short(pending["url"], 60), feed_url=pending["url"],
+            fetch_status="active",
+        )
+        await query.edit_message_text("Added as-is.")
+        await send_rich_async(chat_id, f"""\
+➕ **Added anyway** — `{source_id}`
+
+I'll poll {pending['url']} directly. If it never yields articles it will be \
+marked as errored after a few cycles.\
+""")
+        return
+
+    if data.startswith("feed:"):
+        picked = context.user_data.get("feed_candidates")
+        if not picked:
+            await query.edit_message_text("That choice expired. Run /addsource again.")
+            return
+        idx = int(data.split(":", 1)[1])
+        if idx >= len(picked["cands"]):
+            await query.edit_message_text("That option is no longer valid.")
+            return
+
+        url, kind, count = picked["cands"][idx]
+        from types import SimpleNamespace
+        cand = SimpleNamespace(url=url, kind=kind, item_count=count, title="")
+        await query.edit_message_text(f"Following {_short(url, 48)}.")
+        await _store_discovered_source(chat_id, picked["stream_id"],
+                                       picked["site_url"], cand)
+        context.user_data.pop("feed_candidates", None)
+        return
+
+    logger.warning("Unhandled callback data: %s", data)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -574,26 +663,26 @@ async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_runpipeline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manually trigger the full pipeline."""
+    """Manually run the same news cycle the cron runs."""
     chat_id = update.effective_chat.id
 
-    await send_rich_async(chat_id, "▶️ Running pipeline...\n\n**Step 1/3:** Fetching news...")
+    await send_rich_async(chat_id, "▶️ Running the news cycle...")
 
-    # Run pipeline steps
-    fetch_result = await fetch_all_news()
-    await send_rich_async(chat_id, f"✅ Fetched {fetch_result['total_new']} new articles from {fetch_result['total_sources']} sources.")
+    result = await run_news_cycle()
 
-    await send_rich_async(chat_id, "**Step 2/3:** Summarizing & scoring relevance...")
-    process_result = await process_new_articles()
-    await send_rich_async(chat_id, f"✅ Processed {process_result['processed']} articles ({process_result['relevant']} relevant).")
+    if result.get("skipped"):
+        await send_rich_async(chat_id, "⏳ A cycle is already running — try again shortly.")
+        return
 
-    await send_rich_async(chat_id, "**Step 3/3:** Delivering digest...")
-    deliver_result = await deliver_digest_async(chat_id)
+    lines = [f"✅ Cycle complete — **{result['posted']}** posted "
+             f"from {result['candidates']} candidate(s)."]
+    if result.get("baselined_sources"):
+        lines.append(f"\n🆕 Baselined {result['baselined_sources']} new source(s) — "
+                     f"their existing articles were recorded, not sent.")
+    if result.get("irrelevant"):
+        lines.append(f"\n🚫 {result['irrelevant']} filtered out as not relevant.")
 
-    if deliver_result["delivered"] > 0:
-        await send_rich_async(chat_id, f"✅ Digest delivered: {deliver_result['delivered']} articles.")
-    else:
-        await send_rich_async(chat_id, "📭 No relevant articles to deliver.")
+    await send_rich_async(chat_id, "".join(lines))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -608,8 +697,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     stream_count = conn.execute("SELECT COUNT(*) as c FROM streams").fetchone()["c"]
     source_count = conn.execute("SELECT COUNT(*) as c FROM sources").fetchone()["c"]
     active_sources = conn.execute("SELECT COUNT(*) as c FROM sources WHERE fetch_status = 'active'").fetchone()["c"]
+    pending_baseline = conn.execute("SELECT COUNT(*) as c FROM sources WHERE baselined_at IS NULL").fetchone()["c"]
     article_count = conn.execute("SELECT COUNT(*) as c FROM articles").fetchone()["c"]
-    new_articles = conn.execute("SELECT COUNT(*) as c FROM articles WHERE status = 'new'").fetchone()["c"]
+    queued = conn.execute("SELECT COUNT(*) as c FROM articles WHERE status = 'new'").fetchone()["c"]
+    posted = conn.execute("SELECT COUNT(*) as c FROM articles WHERE status = 'posted'").fetchone()["c"]
 
     conn.close()
 
@@ -621,9 +712,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 | Streams | {stream_count} |
 | Total Sources | {source_count} |
 | Active Sources | {active_sources} |
-| Total Articles | {article_count} |
-| New (Unprocessed) | {new_articles} |
+| Awaiting Baseline | {pending_baseline} |
+| Articles Tracked | {article_count} |
+| Queued to Post | {queued} |
+| Posted | {posted} |
 
 ---
-*Scheduler runs fetch every {config.FETCH_INTERVAL_MINUTES} min, process every {config.PROCESS_INTERVAL_MINUTES} min, deliver every {config.DELIVER_INTERVAL_HOURS} hours.*\
+*The news cycle runs every {config.NEWS_CYCLE_MINUTES} min — up to {config.MAX_NEW_PER_SOURCE} new \
+articles per source, {config.MAX_POSTS_PER_CYCLE} posts per cycle.*\
 """)

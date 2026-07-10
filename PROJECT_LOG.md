@@ -12,35 +12,54 @@ Self-serve news service: user describes a topic → AI research engine finds the
 
 ## What's Built
 
+### Intake (understands the user)
+- Single natural interview loop — no fixed form, no visible scaffolding
+- Interviewer LLM carries a research protocol: beat + angle, what counts as a hit, hard exclusions
+- Asks only what is still unclear *and* would change source selection; hard cap of 4 answers
+- Produces the Source Criteria Profile **and** a bespoke relevance rubric written from the user's own words
+
 ### Research Engine (finds sources)
 - 4-phase pipeline: profile builder → Brave Search discovery → 2-stage qualification → fetch validation
 - LLM: DeepSeek V4 Flash via OpenRouter
 - Crawler: crawl4ai (headless Chromium, memory-saving mode)
 - Deterministic URL heuristics prevent article URLs from being stored as sources
 - Domain-level dedup ensures no duplicate sources
-- Feed URL identification — finds the correct article-list page for each source
+- Feed URL identification — the LLM's guess is *verified*, then repaired by the deterministic finder
 - Internal source DB — sources found for one user benefit future users
 
-### News Pipeline (monitors sources)
-- **Real-time posting** (every 15 min): fetch new articles → write short post via Gemini Flash → send immediately to Telegram
+### News Page Discovery (`research/feed_finder.py`)
+- Crawler-driven and language-agnostic; no path guessing
+- RSS/Atom autodiscovery first (the site declaring its own feed)
+- Otherwise: crawl the homepage, infer sections from where article-shaped URLs actually live
+- Every candidate proved by counting article links with the same filter the poller uses
+- Polite: sequential verification, 1s delay, one retry on a bot challenge, gives up on hostile hosts
+- Never re-crawls the homepage it already fetched
+
+### News Cycle (one cron, every 30 min)
+- Phase A — snapshot each source; **a source's first poll is a silent baseline** (records everything, sends nothing)
+- Phase B — summarize → binary relevance gate (per-stream rubric) → write post → send to the stream's owner
+- Caps: 3 new articles per source per cycle, 10 posts per cycle globally
 - 3-strategy article extraction: RSS feeds → link extraction → LLM inline extraction
-- Failure tolerance: sources deactivated only after 3 consecutive fetch failures
-- Health check: re-tests blocked sources every 24 hours
-- Article dedup via normalized URL hashing
+- Transient failures (LLM outage, network) retry up to 3 times; permanent ones (Telegram 400/403) are terminal
+- Overlap guard: a slow cycle causes the next tick to skip
+- Health check: re-tests **errored** sources every 24 hours (never revives `blocked` ones)
 
 ### Telegram Bot
-- `/newstream` — guided Q&A → AI research → sources found
+- `/newstream` — natural interview → AI research → sources found
 - `/streams`, `/sources`, `/sources_all` — view streams and sources
-- `/addsource`, `/deletesource`, `/testsource` — manual source management
-- `/research` — re-run research for a stream
+- `/addsource` — discovers the site's news page(s); asks if there are several
+- `/deletesource`, `/testsource` — manual source management (ownership-checked)
+- `/research` — re-run research for a stream, regenerating profile + rubric
 - `/latest` — show latest articles
-- `/runpipeline` — manual trigger
-- `/status` — system stats
-- Rich messages throughout (tables, headings, links via `sendRichMessage`)
+- `/runpipeline` — manually run the same news cycle the cron runs
+- `/status` — system stats, including sources awaiting baseline
+- Inline keyboards wired through a `CallbackQueryHandler`
+- `sendRichMessage` for bot chrome; plain `sendMessage` + sanitized Telegram HTML for news posts
 
 ### Database
-- SQLite: streams, sources (with feed_url, fail_count), articles
-- Auto-migrations for schema changes
+- SQLite: streams, sources (feed_url, fail_count, baselined_at), articles (status, attempts, posted_at)
+- Article states: `seen` | `new` | `posted` | `irrelevant` — every article ends terminal
+- Auto-migrations for schema changes (sources and articles)
 
 ---
 
@@ -70,6 +89,47 @@ Self-serve news service: user describes a topic → AI research engine finds the
 - Removed batch digest notifications from fetch cron
 - Added `LLM_MODEL_POST` config for separate post-writing model
 
+### Jul 9–10, 2026 — Deployment, and the Great De-Spamming
+
+**Deployed to the server.** Runs under `systemd` (`test-news-saas.service`) in webhook mode
+behind nginx at `bot.simple-flow.co/test-news-saas` → `127.0.0.1:3010`.
+
+**Fixed: research found no sources.** Playwright's Chromium was never installed — discovery
+found 39 candidates and the crawler fetched 0 of 39 homepages, so qualification had nothing to
+read. The crawler singleton also cached its own half-started instance, so it could never recover.
+
+**Fixed: 268 spam messages.** Three compounding bugs:
+- No first-run baseline — every link on a new source's page counted as "new".
+- `cron_stream_post` (15 min) raced ahead of `cron_process_articles` (60 min) and won, so every
+  posted article had `relevance_score = 0.0`. The relevance check was never consulted.
+- `MAX_ARTICLES_PER_FETCH = 15` per source with no global ceiling.
+
+**Rebuilt the delivery path.** Removed the legacy digest (`deliver.py`) and the racing poster
+(`stream_poster.py`); consolidated four crons into one `pipeline/news_cycle.py`. Added the silent
+baseline, the per-stream relevance gate, per-source and global caps, and owner-routed delivery.
+
+**Rewrote intake.** Replaced the fixed `Q1/Q2/Q3` form and its generic LLM follow-ups with a single
+natural interview driven by a real research protocol. Removed the visible
+"🧠 Generating follow-up questions…" scaffolding in favour of a typing indicator.
+
+**Rewrote post formatting.** `write_post()` was being fed raw crawled page HTML; it now reads the
+summary. Prompt ported from `re_news_channel` (English), with its factual-accuracy rules intact.
+News posts now go out via `sendMessage` + `parse_mode=HTML` with a `sanitize_telegram_html()` pass.
+
+**Added deterministic news-page discovery.** `/addsource` now finds the page that actually lists a
+site's articles, by crawling rather than guessing paths. Verified on `coindesk.com` (homepage, 33),
+`anthropic.com` (`/policy` 25, `/research` 18, `/news` 15), `tagesschau.de` (RSS, German), and
+`example.com` (correctly nothing).
+
+**Fixed: "deleting sources doesn't work".** The SQL was always fine. `/sources` showed a row number
+where `/deletesource` expected the database id, and every inline button was inert because no
+`CallbackQueryHandler` was registered. Added an ownership check while there.
+
+**Other fixes:** `reset_fail_count()` no longer resurrects `blocked` sources; articles can no
+longer be retried forever, nor silently discarded by a transient LLM outage; `fetch_page()` no
+longer returns `title=None`; streams stranded in `researching` by a restart are reconciled on boot;
+speculative feed probing no longer trips Cloudflare and locks the crawler out.
+
 ---
 
 ## Tech Stack
@@ -88,9 +148,23 @@ Self-serve news service: user describes a topic → AI research engine finds the
 
 ## How to Run
 
+Deployed on the server as a systemd unit, in webhook mode:
+
 ```bash
-cd /Users/nikti/Documents/News\ SaaS
-/Library/Frameworks/Python.framework/Versions/3.13/bin/python3 main.py
+systemctl status  test-news-saas.service
+systemctl restart test-news-saas.service
+journalctl -u     test-news-saas.service -f
 ```
 
-Note: must use Framework Python (not Homebrew) — dependencies are installed there.
+First-time setup:
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+python -m playwright install chromium   # crawl4ai needs the browser
+cp .env.example .env                    # then fill in the four keys
+python main.py
+```
+
+The webhook is registered automatically on boot to `$WEBHOOK_HOST$WEBHOOK_PATH`
+(default `https://bot.simple-flow.co/test-news-saas`), served by nginx on `127.0.0.1:3010`.

@@ -31,16 +31,12 @@ from bot.handlers import (
     cmd_latest,
     cmd_runpipeline,
     cmd_status,
-    # Conversation handlers
-    handle_topic,
-    handle_strictness,
-    handle_exclusions,
-    handle_followups,
+    # Conversation handler (single natural interview loop)
+    handle_interview,
     cancel_conversation,
-    TOPIC,
-    STRICTNESS,
-    EXCLUSIONS,
-    FOLLOWUPS,
+    INTERVIEW,
+    # Inline button router
+    handle_callback,
 )
 from bot.messaging import send_rich
 
@@ -60,54 +56,25 @@ logger = logging.getLogger(__name__)
 # Cron job wrappers (run async pipeline in the bot's event loop)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def cron_stream_post(context):
-    """Cron: fetch articles → write posts → send to Telegram immediately."""
-    from pipeline.stream_poster import process_and_post_articles
-    logger.info("CRON: Stream poster running...")
+async def cron_news_cycle(context):
+    """The one cron: poll sources → gate → post."""
+    from pipeline.news_cycle import run_news_cycle
+    logger.info("CRON: News cycle running...")
     try:
-        result = await process_and_post_articles()
-        logger.info("CRON: Stream poster done — fetched %d, posted %d",
-                    result["fetched"], result["posted"])
-    except Exception as e:
-        logger.error("CRON stream poster error: %s", e)
-
-
-async def cron_fetch_news(context):
-    """Cron: fetch news from all active sources (legacy, for digest mode)."""
-    from pipeline.fetch_news import fetch_all_news
-    logger.info("CRON: Fetching news...")
-    try:
-        result = await fetch_all_news()
-        logger.info("CRON: Fetch complete — %d new articles", result["total_new"])
-    except Exception as e:
-        logger.error("CRON fetch error: %s", e)
-
-
-async def cron_process_articles(context):
-    """Cron: summarize and score new articles."""
-    from pipeline.summarize import process_new_articles
-    logger.info("CRON: Processing articles...")
-    try:
-        result = await process_new_articles()
-        logger.info("CRON: Processed %d articles (%d relevant)",
-                    result["processed"], result["relevant"])
-    except Exception as e:
-        logger.error("CRON process error: %s", e)
-
-
-async def cron_deliver_digest(context):
-    """Cron: deliver compiled digest."""
-    from pipeline.deliver import deliver_digest_async
-    logger.info("CRON: Delivering digest...")
-    try:
-        result = await deliver_digest_async(config.TELEGRAM_CHAT_ID)
-        logger.info("CRON: Delivered %d articles", result["delivered"])
-    except Exception as e:
-        logger.error("CRON deliver error: %s", e)
+        result = await run_news_cycle()
+        if result.get("skipped"):
+            return
+        logger.info("CRON: News cycle done — posted %d of %d candidates",
+                    result["posted"], result["candidates"])
+    except Exception:
+        logger.exception("CRON news cycle error")
 
 
 async def cron_health_check(context):
-    """Cron: re-test blocked/error sources."""
+    """Cron: re-test sources that errored out and bring the healthy ones back.
+
+    Only touches 'error' sources — a 'blocked' source stays blocked.
+    """
     from database import store
     from crawler.fetcher import test_source
     logger.info("CRON: Health check...")
@@ -115,7 +82,7 @@ async def cron_health_check(context):
     from database.models import get_connection
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, url, feed_url FROM sources WHERE fetch_status IN ('blocked', 'error')"
+        "SELECT id, url, feed_url FROM sources WHERE fetch_status = 'error'"
     ).fetchall()
     conn.close()
 
@@ -124,7 +91,7 @@ async def cron_health_check(context):
         # Test the page the pipeline actually crawls
         result = await test_source(row["feed_url"] or row["url"])
         if result["fetchable"]:
-            store.reset_fail_count(row["id"])  # sets status back to active
+            store.reactivate_source(row["id"])
             reactivated += 1
 
     if reactivated > 0:
@@ -146,10 +113,7 @@ def build_application() -> Application:
     newstream_conv = ConversationHandler(
         entry_points=[CommandHandler("newstream", cmd_newstream)],
         states={
-            TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_topic)],
-            STRICTNESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_strictness)],
-            EXCLUSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_exclusions)],
-            FOLLOWUPS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_followups)],
+            INTERVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interview)],
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
         allow_reentry=True,
@@ -172,6 +136,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("runpipeline", cmd_runpipeline))
     app.add_handler(CommandHandler("status", cmd_status))
+    # Inline keyboards are inert without this.
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(error_handler)
 
     return app
@@ -188,36 +154,12 @@ def setup_scheduler(app: Application) -> None:
                        "Install with: pip install 'python-telegram-bot[job-queue]'")
         return
 
-    # Real-time article posting every N minutes
+    # The one news cycle: poll sources → gate → post
     job_queue.run_repeating(
-        cron_stream_post,
-        interval=config.STREAM_POST_INTERVAL_MINUTES * 60,
-        first=30,  # start 30 seconds after boot
-        name="stream_post",
-    )
-
-    # Fetch news every N minutes (legacy)
-    job_queue.run_repeating(
-        cron_fetch_news,
-        interval=config.FETCH_INTERVAL_MINUTES * 60,
-        first=config.FETCH_INTERVAL_MINUTES * 60,
-        name="fetch_news",
-    )
-
-    # Process articles every N minutes
-    job_queue.run_repeating(
-        cron_process_articles,
-        interval=config.PROCESS_INTERVAL_MINUTES * 60,
-        first=config.PROCESS_INTERVAL_MINUTES * 60,
-        name="process_articles",
-    )
-
-    # Deliver digest every N hours
-    job_queue.run_repeating(
-        cron_deliver_digest,
-        interval=config.DELIVER_INTERVAL_HOURS * 3600,
-        first=config.DELIVER_INTERVAL_HOURS * 3600,
-        name="deliver_digest",
+        cron_news_cycle,
+        interval=config.NEWS_CYCLE_MINUTES * 60,
+        first=120,  # let the bot settle before the first poll
+        name="news_cycle",
     )
 
     # Health check every 24 hours
@@ -228,10 +170,9 @@ def setup_scheduler(app: Application) -> None:
         name="health_check",
     )
 
-    logger.info("Scheduler configured: stream_post=%dmin, fetch=%dmin, process=%dmin, deliver=%dh, health=%dh",
-                config.STREAM_POST_INTERVAL_MINUTES, config.FETCH_INTERVAL_MINUTES,
-                config.PROCESS_INTERVAL_MINUTES, config.DELIVER_INTERVAL_HOURS,
-                config.HEALTH_CHECK_INTERVAL_HOURS)
+    logger.info("Scheduler configured: news_cycle=%dmin (max %d/source, %d posts/cycle), health=%dh",
+                config.NEWS_CYCLE_MINUTES, config.MAX_NEW_PER_SOURCE,
+                config.MAX_POSTS_PER_CYCLE, config.HEALTH_CHECK_INTERVAL_HOURS)
 
 
 def main():
@@ -239,6 +180,13 @@ def main():
     # Initialize database
     logger.info("Initializing database...")
     init_db()
+
+    # A restart during research strands that stream in 'researching' forever.
+    from database import store
+    freed = store.reset_stuck_research()
+    if freed:
+        logger.warning("Reset %d stream(s) stranded mid-research — "
+                       "re-run /research <id> to populate them", freed)
 
     # Build application
     logger.info("Building Telegram bot application...")
@@ -252,27 +200,30 @@ def main():
     logger.info("Starting bot...")
     send_rich(
         config.TELEGRAM_CHAT_ID,
-        """\
+        f"""\
 # 🟢 NewsStream Bot Online
 
-The research engine and pipeline are running.
+The research engine and news cycle are running.
 
-## Active Cron Jobs
-
-| Job | Interval |
-|-----|----------|
-| **Stream Post** | **Every 15 min** |
-| Fetch News | Every 30 min |
-| Process Articles | Every 60 min |
-| Deliver Digest | Every 6 hours |
-| Health Check | Every 24 hours |
+I check every source's article list every **{config.NEWS_CYCLE_MINUTES} minutes**. \
+A newly added source is baselined on its first check — I record what's already \
+published and only send you what appears *after* that.
 
 Use `/newstream` to create your first news stream.\
 """,
     )
 
-    # Run the bot
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Run the bot (webhook mode, served behind nginx at bot.simple-flow.co)
+    logger.info("Starting webhook: %s (listening on %s:%d)",
+                config.WEBHOOK_URL, config.LISTEN_HOST, config.LISTEN_PORT)
+    app.run_webhook(
+        listen=config.LISTEN_HOST,
+        port=config.LISTEN_PORT,
+        url_path=config.WEBHOOK_PATH,
+        webhook_url=config.WEBHOOK_URL,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":

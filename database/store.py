@@ -198,11 +198,54 @@ def increment_fail_count(source_id: int) -> int:
 
 
 def reset_fail_count(source_id: int) -> None:
+    """Clear the consecutive-failure counter after a successful fetch.
+
+    Deliberately does NOT touch fetch_status — a source the user blocked stays
+    blocked. Use reactivate_source() to bring an errored source back.
+    """
     conn = get_connection()
     conn.execute(
-        "UPDATE sources SET fail_count = 0, fetch_status = 'active', "
+        "UPDATE sources SET fail_count = 0, last_checked = datetime('now') WHERE id = ?",
+        (source_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def reactivate_source(source_id: int) -> None:
+    """Bring an errored source back to active (health check only)."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE sources SET fetch_status = 'active', fail_count = 0, "
         "last_checked = datetime('now') WHERE id = ?",
         (source_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def reset_stuck_research() -> int:
+    """
+    Research runs in a background task and is not resumable. If the process dies
+    mid-run, its stream is stranded in 'researching' and the news cycle — which
+    only serves active streams — ignores it forever. Reconcile on boot.
+    Returns how many streams were freed.
+    """
+    conn = get_connection()
+    cur = conn.execute(
+        "UPDATE streams SET status = 'active' WHERE status = 'researching'"
+    )
+    conn.commit()
+    freed = cur.rowcount
+    conn.close()
+    return freed
+
+
+def mark_source_baselined(source_id: int) -> None:
+    """Record that this source has had its first snapshot taken."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE sources SET baselined_at = datetime('now') WHERE id = ?", (source_id,)
     )
     conn.commit()
     conn.close()
@@ -285,6 +328,59 @@ def update_article_status(article_id: int, status: str, relevance_score: float =
         conn.execute(
             "UPDATE articles SET status = ? WHERE id = ?", (status, article_id)
         )
+    conn.commit()
+    conn.close()
+
+
+def mark_posted(article_id: int) -> None:
+    """Terminal status for an article that was successfully sent."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE articles SET status = 'posted', posted_at = datetime('now') WHERE id = ?",
+        (article_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def increment_article_attempts(article_id: int) -> int:
+    """Count a transient processing failure; returns the new attempt count."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE articles SET attempts = COALESCE(attempts, 0) + 1 WHERE id = ?",
+        (article_id,),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT attempts FROM articles WHERE id = ?", (article_id,)
+    ).fetchone()
+    conn.close()
+    return row["attempts"] if row else 0
+
+
+def get_queued_articles(limit: int) -> list[dict]:
+    """Articles awaiting processing, oldest first, for active streams only."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT a.*, s.stream_id, s.name AS source_name, st.user_id
+           FROM articles a
+           JOIN sources s ON a.source_id = s.id
+           JOIN streams st ON s.stream_id = st.id
+           WHERE a.status = 'new' AND st.status = 'active'
+           ORDER BY a.fetched_at ASC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def update_stream_criteria(stream_id: int, criteria: dict) -> None:
+    """Persist a (re)generated profile back onto the stream."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE streams SET criteria = ? WHERE id = ?",
+        (json.dumps(criteria), stream_id),
+    )
     conn.commit()
     conn.close()
 

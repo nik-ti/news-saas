@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import config
 from database import store
-from research.profile_builder import build_profile, generate_followup_questions
+from research.profile_builder import build_profile
 from research.discovery import generate_search_queries, search_parallel
 from research.qualification import qualify_all
 from research.validator import validate_sources
@@ -234,6 +234,36 @@ async def node_validate(state: ResearchState,
     return state
 
 
+async def _repair_feed_url(src: dict) -> dict:
+    """
+    The qualifier asks an LLM to name each source's article-list page. Trust but
+    verify: if that page doesn't actually expose articles, fall back to the
+    deterministic finder. A source whose feed_url is a marketing homepage would
+    silently never produce news.
+    """
+    from crawler.fetcher import fetch_page
+    from pipeline.fetch_news import article_links_on_page
+    from research.feed_finder import find_news_pages, MIN_ARTICLE_LINKS
+
+    feed_url = src.get("feed_url") or src["url"]
+    page = await fetch_page(feed_url)
+    if page["success"] and len(article_links_on_page(page, feed_url)) >= MIN_ARTICLE_LINKS:
+        return src  # the LLM was right
+
+    logger.info("feed_url %s exposes too few articles — rediscovering", feed_url)
+    try:
+        candidates = await find_news_pages(src["url"])
+    except Exception as e:
+        logger.warning("Feed rediscovery failed for %s: %s", src["url"], e)
+        return src
+
+    if candidates:
+        logger.info("Repaired feed_url for %s: %s → %s",
+                    src["url"], feed_url, candidates[0].url)
+        src["feed_url"] = candidates[0].url
+    return src
+
+
 async def node_finalize(state: ResearchState,
                          progress: ProgressCallback = None) -> ResearchState:
     """Merge qualification + validation results, prepare for storage."""
@@ -263,6 +293,11 @@ async def node_finalize(state: ResearchState,
                 final.append(_to_source_dict(q))
             if len(final) >= config.DESIRED_SOURCES_MIN:
                 break
+
+    # Make sure each source's feed_url is a page that really lists articles.
+    if final:
+        await progress("🔧 Confirming each source's news page...")
+        final = list(await asyncio.gather(*(_repair_feed_url(s) for s in final)))
 
     state["final_sources"] = final
     await progress(f"🎯 Final result: {len(final)} validated sources ready")
@@ -326,12 +361,3 @@ async def run_research(answers: dict, stream_id: int,
     logger.info("Research complete: %d sources stored for stream %d",
                 len(state["final_sources"]), stream_id)
     return state
-
-
-async def run_research_with_followups(answers: dict, stream_id: int,
-                                       progress: ProgressCallback = None) -> dict:
-    """
-    Like run_research, but first generates dynamic follow-up questions.
-    (Used for the Telegram conversation flow.)
-    """
-    return await run_research(answers, stream_id, progress)

@@ -1,5 +1,7 @@
 # Environment
 .env
+.env.*
+!.env.example
 bot.log
 test_output.log
 

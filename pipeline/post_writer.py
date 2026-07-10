@@ -1,81 +1,121 @@
 """
 Pipeline — Post Writer.
-Takes article content and writes a short Telegram news post via LLM.
-Adapted from telegram-news-channel template.
+Turns an article SUMMARY into a short, clean Telegram news post (Telegram HTML).
+Adapted from the re_news_channel post writer.
 """
 import logging
 
+import config
 from research.llm import chat_post
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_MESSAGE = """\
-You write short, punchy Telegram news posts from article content.
+You write short English-language Telegram news posts.
 
 ## Core Rule
 
 You MUST write the post. ALWAYS. NO EXCEPTIONS.
-Your output is ONLY the post itself. Nothing else. No explanations, \
-no rejections, no meta-commentary. Start IMMEDIATELY with the post.
+Relevance is checked by another system — your job is ONLY to write.
+If the article seems off-topic or unclear, write about whatever news IS in it anyway.
+
+Your output is ONLY the post itself. Nothing else. No explanations, no rejections, \
+no meta-commentary, no preamble. Start IMMEDIATELY with the post title.
+
+---
+
+## Factual Accuracy
+
+Preserve the precise meaning of the source. Never strengthen language for impact, \
+and never make uncertain things sound certain:
+
+* "projected growth" → projected, NOT guaranteed
+* "under consideration" / "under review" → being considered, NOT decided
+* "could lead to" → could, NOT will
+* "proposed" → proposed, NOT launched
+* Delayed ≠ Cancelled ≠ Approved.
+
+If the source hedges, you hedge.
+
+---
+
+## One Post = One Main Point
+
+Focus on ONE main news item. Don't cover multiple developments or summarise an \
+entire long article. Before writing, identify: (1) the ONE main piece of news, \
+(2) who it affects, (3) when it takes effect, (4) what context the reader needs.
 
 ---
 
 ## Style & Format
 
 **Writing:**
-* Natural English. Professional, calm tone. No sensationalism.
-* Short paragraphs (2-3 lines max), line breaks for readability.
-* One post = one main point. Pick the most important news, explain it clearly.
+* Natural English. Professional, calm tone. No sensationalism, no hype.
+* No first-person, no rhetorical questions.
+* Short paragraphs (2-3 lines max), blank line between them for readability.
+* Use 🔹 bullet points for listing related facts.
 
-**Length:** 300-600 characters.
+**Structure:**
+* First line: the headline, wrapped in <b>...</b>, optionally ending with one emoji.
+* Blank line, then the body.
 
-**Emojis:** 1-3, used naturally.
+**Length:** 400-700 characters (including HTML tags and emojis).
 
-**HTML formatting:** Use `<b>`, `<i>`, `<a href="">`, `<code>` only.
-Bold key dates, names, numbers. Link to source if available.
+**Emojis:** 1-3, used naturally. Common: 📊 📌 ⚠️ ✅ 🔹 📎 ➡️ 🏛 💼 🔬
+
+**HTML only:** <b>, <i>, <code>, <a href="">. Bold key numbers, dates, names.
+Never use <p>, <ul>, <li>, <h1> or any other tag — Telegram rejects them.
 
 ---
 
 ## Context
 
-Briefly explain specialized terms on first mention.
+Briefly explain specialised terms, acronyms, or jargon on first mention.
 
 ---
 
 ## Example Output
 
-<b>EU finalises MiCA stablecoin rules</b>
+<b>EU finalises MiCA stablecoin rules 🏛</b>
 
 The European Commission has approved the technical standards for MiCA's \
-stablecoin provisions, setting strict reserve and transparency requirements.
+stablecoin provisions, setting reserve and transparency requirements for issuers.
 
-📅 In effect: June 2026
-🏛️ Affects: all stablecoin issuers operating in the EU
-<a href="SOURCE_URL">Read more →</a>
+🔹 In effect: <b>June 2026</b>
+🔹 Affects: all stablecoin issuers operating in the EU
+
+MiCA (Markets in Crypto-Assets) is the EU's unified crypto framework, phased in since 2024.
 
 ---
 
-**Input:** Article text (may include title, summary, and full content).
-**Output:** Short Telegram news post, HTML format."""
+**Input:** An article summary (and its title).
+**Output:** A short Telegram news post in English, HTML format."""
 
 
-async def write_post(article_text: str, source_url: str = "") -> str:
+async def write_post(summary_text: str, title: str = "", source_url: str = "") -> str:
     """
-    Write a short Telegram post from article content.
-    Returns HTML string ready to send.
+    Write a short Telegram post from an article summary.
+    Returns Telegram-HTML ready to send, with a source link appended.
     """
-    prompt = f"Article text:\n\n{article_text[:4000]}"
-    if source_url:
-        prompt += f"\n\nSource URL: {source_url}"
+    parts = []
+    if title:
+        parts.append(f"Title: {title}")
+    parts.append(f"Summary:\n{summary_text[:config.POST_INPUT_CHAR_CAP]}")
+    prompt = "\n\n".join(parts)
 
     try:
         raw = await chat_post(SYSTEM_MESSAGE, prompt)
-        post = _strip_code_blocks(raw)
-        post = _strip_preamble(post)
-        return post
     except Exception as e:
         logger.error("Post writer error: %s", e)
         return ""
+
+    post = _strip_preamble(_strip_code_blocks(raw))
+    if not post:
+        return ""
+
+    if source_url:
+        post = f'{post}\n\n🔗 <a href="{source_url}">Source</a>'
+    return post
 
 
 def _strip_code_blocks(text: str) -> str:
@@ -83,10 +123,7 @@ def _strip_code_blocks(text: str) -> str:
     cleaned = text.strip()
     if cleaned.startswith("```"):
         first_nl = cleaned.find("\n")
-        if first_nl != -1:
-            cleaned = cleaned[first_nl + 1:]
-        else:
-            cleaned = cleaned[3:]
+        cleaned = cleaned[first_nl + 1:] if first_nl != -1 else cleaned[3:]
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3]
     return cleaned.strip()

@@ -48,6 +48,7 @@ def init_db() -> None:
         fail_count      INTEGER DEFAULT 0,
         last_checked    TEXT,
         last_fetched    TEXT,
+        baselined_at    TEXT,   -- set after the first snapshot; NULL = never polled
         created_at      TEXT    DEFAULT (datetime('now'))
     );
 
@@ -58,9 +59,11 @@ def init_db() -> None:
         url             TEXT,
         summary         TEXT,
         relevance_score REAL    DEFAULT 0,
-        status          TEXT    DEFAULT 'new',   -- new | processed | irrelevant
+        status          TEXT    DEFAULT 'new',   -- seen | new | posted | irrelevant
         fetched_at      TEXT    DEFAULT (datetime('now')),
         delivered_at    TEXT,
+        posted_at       TEXT,
+        attempts        INTEGER DEFAULT 0,  -- transient-failure retries
         content_hash    TEXT    -- for dedup
     );
 
@@ -71,14 +74,23 @@ def init_db() -> None:
 
     # Migrations for databases created before these columns existed
     # (must run AFTER table creation, or a fresh DB has no sources table to alter)
-    existing_cols = {row[1] for row in cur.execute("PRAGMA table_info(sources)")}
-    for col, ddl in [
-        ("feed_url", "ALTER TABLE sources ADD COLUMN feed_url TEXT"),
-        ("fail_count", "ALTER TABLE sources ADD COLUMN fail_count INTEGER DEFAULT 0"),
-    ]:
-        if col not in existing_cols:
-            cur.execute(ddl)
-            logger.info("Migration: added %s column to sources table", col)
+    migrations = {
+        "sources": [
+            ("feed_url", "ALTER TABLE sources ADD COLUMN feed_url TEXT"),
+            ("fail_count", "ALTER TABLE sources ADD COLUMN fail_count INTEGER DEFAULT 0"),
+            ("baselined_at", "ALTER TABLE sources ADD COLUMN baselined_at TEXT"),
+        ],
+        "articles": [
+            ("posted_at", "ALTER TABLE articles ADD COLUMN posted_at TEXT"),
+            ("attempts", "ALTER TABLE articles ADD COLUMN attempts INTEGER DEFAULT 0"),
+        ],
+    }
+    for table, cols in migrations.items():
+        existing_cols = {row[1] for row in cur.execute(f"PRAGMA table_info({table})")}
+        for col, ddl in cols:
+            if col not in existing_cols:
+                cur.execute(ddl)
+                logger.info("Migration: added %s column to %s table", col, table)
 
     conn.commit()
     conn.close()

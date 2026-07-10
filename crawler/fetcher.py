@@ -30,8 +30,15 @@ async def _get_crawler():
             light_mode=True,         # minimal browser setup
             memory_saving_mode=True, # aggressive memory optimization
         )
-        _crawler = AsyncWebCrawler(config=browser_config)
-        await _crawler.start()
+        crawler = AsyncWebCrawler(config=browser_config)
+        try:
+            await crawler.start()
+        except Exception:
+            # Don't cache a half-initialised browser — otherwise every later
+            # fetch reuses the broken instance and silently returns 0 pages.
+            _crawler = None
+            raise
+        _crawler = crawler
     return _crawler
 
 
@@ -59,6 +66,7 @@ async def fetch_page(url: str) -> Optional[dict]:
                     "url": url,
                     "title": "",
                     "content": "",
+                    "html": "",
                     "links": [],
                     "success": False,
                     "error": result.error_message or "Unknown error",
@@ -80,15 +88,28 @@ async def fetch_page(url: str) -> Optional[dict]:
                 elif isinstance(raw_links, list):
                     links = raw_links
 
-            # Extract title from metadata
+            # Extract title from metadata. The key can be present but null,
+            # so coerce — callers slice this string.
             title = ""
             if hasattr(result, "metadata") and result.metadata:
-                title = result.metadata.get("title", "")
+                title = result.metadata.get("title") or ""
+
+            # Raw HTML for feed autodiscovery. Sites behind Cloudflare answer the
+            # browser but 403 a plain HTTP client, so the crawler is often the only
+            # way to see their <link> tags. Keep the whole <head> — some sites bury
+            # megabytes of inline JSON in it, and a blind cap would slice off the
+            # feed declaration that lives at the end.
+            raw_html = ""
+            if hasattr(result, "html") and result.html:
+                head_end = result.html.lower().find("</head>")
+                raw_html = (result.html[:head_end + 7] if head_end != -1
+                            else result.html[:150_000])
 
             return {
                 "url": url,
                 "title": title,
                 "content": content_text[:8000],  # cap to avoid huge payloads
+                "html": raw_html,
                 "links": links[:100],  # cap links
                 "success": True,
                 "error": None,
@@ -99,6 +120,7 @@ async def fetch_page(url: str) -> Optional[dict]:
                 "url": url,
                 "title": "",
                 "content": "",
+                "html": "",
                 "links": [],
                 "success": False,
                 "error": str(e),
@@ -114,7 +136,7 @@ async def fetch_multiple(urls: list[str]) -> list[dict]:
     for url, result in zip(urls, results):
         if isinstance(result, Exception):
             final.append({
-                "url": url, "title": "", "content": "", "links": [],
+                "url": url, "title": "", "content": "", "html": "", "links": [],
                 "success": False, "error": str(result),
             })
         else:

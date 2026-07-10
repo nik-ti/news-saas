@@ -16,6 +16,10 @@ SECTION_SEGMENTS = {
     "publications", "briefs", "reports", "newsroom", "media",
 }
 
+# Last segments that always mean "this is a listing", never a single article.
+# /research/index/ and /blog/archive are indexes, not stories.
+INDEX_SEGMENTS = {"index", "archive", "archives", "all", "page", "home"}
+
 _DATE_PATTERN = re.compile(r"/(19|20)\d{2}([/-]\d{1,2})?([/-]\d{1,2})?(/|$)")
 _NUMERIC_ID_PATTERN = re.compile(r"/\d{4,}(/|$)")
 
@@ -52,6 +56,10 @@ def is_article_url(url: str) -> bool:
 
     # A known section name as the last segment → list page, not an article
     if last in SECTION_SEGMENTS:
+        return False
+
+    # An explicit index/archive segment → list page (e.g. /research/index/)
+    if last in INDEX_SEGMENTS:
         return False
 
     # File extensions → article/document

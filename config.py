@@ -32,14 +32,24 @@ DESIRED_SOURCES_MIN = 3
 DESIRED_SOURCES_MAX = 8
 ARTICLES_TO_EXAMINE = 3          # articles to fetch per candidate source (deep dive)
 MAX_CONSECUTIVE_FETCH_FAILURES = 3  # deactivate a source only after N failed cycles
-MAX_ARTICLES_PER_FETCH = 15      # cap new articles per source per fetch cycle
 
 # ── Pipeline / Cron ───────────────────────────────────────────────────────────
-STREAM_POST_INTERVAL_MINUTES = 15   # real-time article posting cron
-FETCH_INTERVAL_MINUTES = 30         # legacy fetch-only cron
-PROCESS_INTERVAL_MINUTES = 60
-DELIVER_INTERVAL_HOURS = 6
+NEWS_CYCLE_MINUTES = 30          # the one cron: poll sources → gate → post
+MAX_NEW_PER_SOURCE = 3           # new articles queued per source per cycle
+MAX_POSTS_PER_CYCLE = 10         # global cap on messages sent per cycle
+MAX_ARTICLE_ATTEMPTS = 3         # transient failures before an article is dropped
 HEALTH_CHECK_INTERVAL_HOURS = 24
+
+# ── Text budgets ──────────────────────────────────────────────────────────────
+SUMMARY_CHAR_CAP = 1500          # summary handed to the gate and the post writer
+POST_INPUT_CHAR_CAP = 2000       # cap on what the post writer reads
 
 # ── Telegram API base (for sendRichMessage) ──────────────────────────────────
 API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+# ── Webhook (served behind nginx at bot.simple-flow.co) ───────────────────────
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "https://bot.simple-flow.co")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/test-news-saas")
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+LISTEN_HOST = "127.0.0.1"
+LISTEN_PORT = int(os.getenv("LISTEN_PORT", "3010"))

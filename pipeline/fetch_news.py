@@ -1,6 +1,9 @@
 """
-Pipeline — Fetch News.
-Cron job: pulls latest articles from each active source in parallel.
+Pipeline — Source snapshotting.
+
+Reads a source's article-list page and reports EVERYTHING currently on it.
+Deciding what is new, what to baseline, and what to post is the caller's job
+(see pipeline/news_cycle.py) — this module performs no DB writes.
 
 Three extraction strategies per source, in order:
   1. RSS/Atom: if the feed_url looks like a feed, parse it directly (no browser).
@@ -8,14 +11,11 @@ Three extraction strategies per source, in order:
   3. LLM fallback: for pages with inline content and no per-entry links
      (changelogs, update-card pages), extract items from the page text itself.
 """
-import asyncio
 import logging
 
 import httpx
 
-import config
 from crawler.fetcher import fetch_page, extract_article_links, content_hash
-from database import store
 from research.llm import chat_json
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,26 @@ logger = logging.getLogger(__name__)
 RSS_URL_HINTS = ("/feed", "/rss", ".rss", ".xml", "/atom", "format=rss")
 
 
-async def _fetch_rss_items(feed_url: str) -> list[dict]:
+def article_links_on_page(page: dict, feed_url: str) -> list[dict]:
+    """
+    The article links we would actually poll from this page.
+
+    Keep only links that are plausibly articles: an article-like URL slug, or a
+    headline-length title. Nav links ("Config Generator", "Setup Guide") pass the
+    generic extractor but not this bar. A real headline is never a single word —
+    that drops category links like "Alignment" whose URLs (/research/alignment)
+    are indistinguishable from article slugs.
+
+    Shared by the poller and by feed discovery, so "a page worth polling" means
+    exactly the same thing in both.
+    """
+    all_links = extract_article_links(page, base_url=feed_url, same_domain_only=True)
+    return [l for l in all_links
+            if (l.get("article_like") or len(l["title"]) >= 40)
+            and len(l["title"].split()) >= 3]
+
+
+async def fetch_rss_items(feed_url: str) -> list[dict]:
     """
     Fetch and parse an RSS/Atom feed directly over HTTP (no headless browser).
     Returns [] if the URL isn't actually a parseable feed.
@@ -117,138 +136,54 @@ async def _extract_inline_items(feed_url: str, page: dict) -> list[dict]:
     return extracted
 
 
-async def fetch_source_news(source: dict) -> list[dict]:
+class SourceFetchError(Exception):
+    """The source's feed page could not be read this cycle."""
+
+
+def _item(title: str, url: str, summary: str = "", c_hash: str = "") -> dict:
+    return {
+        "title": title,
+        "url": url,
+        "summary": summary,
+        "content_hash": c_hash or content_hash(url.split("?")[0].rstrip("/").lower()),
+    }
+
+
+async def snapshot_source(source: dict) -> list[dict]:
     """
-    Fetch the latest articles from a single source.
-    Returns list of new article dicts.
+    Return EVERY article currently listed on this source's feed page.
+
+    Pure read: no DB writes, no dedup, no caps. Raises SourceFetchError if the
+    page can't be read, so the caller can decide how to count the failure.
     """
     url = source["url"]
-    source_id = source["id"]
-
-    # Use feed_url if available, otherwise fall back to the main url
     feed_url = source.get("feed_url") or url
 
     # Strategy 0: RSS/Atom feed — parse directly, no browser needed
     if any(h in feed_url.lower() for h in RSS_URL_HINTS):
-        rss_items = await _fetch_rss_items(feed_url)
+        rss_items = await fetch_rss_items(feed_url)
         if rss_items:
-            store.update_source_fetch_time(source_id)
-            store.reset_fail_count(source_id)
-            new_articles = []
-            for item in rss_items:
-                c_hash = content_hash(item["url"].split("?")[0].rstrip("/").lower())
-                if store.article_exists(c_hash):
-                    continue
-                new_articles.append({
-                    "source_id": source_id,
-                    "title": item["title"],
-                    "url": item["url"],
-                    "summary": item.get("summary", ""),
-                    "content_hash": c_hash,
-                })
-                if len(new_articles) >= config.MAX_ARTICLES_PER_FETCH:
-                    break
-            logger.info("Source %s (RSS): %d new articles", url, len(new_articles))
-            return new_articles
+            items = [_item(i["title"], i["url"], i.get("summary", "")) for i in rss_items]
+            logger.info("Source %s (RSS): %d items on page", url, len(items))
+            return items
 
     page = await fetch_page(feed_url)
     if not page["success"]:
-        logger.warning("Fetch failed for source %s: %s", url, page["error"])
-        # Tolerate transient failures; only deactivate after N consecutive ones
-        fails = store.increment_fail_count(source_id)
-        if fails >= config.MAX_CONSECUTIVE_FETCH_FAILURES:
-            store.update_source_status(source_id, "error")
-            logger.warning("Source %s marked as error after %d consecutive failures",
-                           url, fails)
-        return []
-
-    # Mark source as successfully fetched
-    store.update_source_fetch_time(source_id)
-    store.reset_fail_count(source_id)
+        raise SourceFetchError(page.get("error") or "unknown fetch error")
 
     # Strategy 1: extract article links from the feed page.
-    # Keep only links that are plausibly articles: article-like URL slug, or a
-    # headline-length title. Nav links ("Config Generator", "Setup Guide")
-    # pass the generic extractor but not this bar. A real headline is never a
-    # single word — that drops category links like "Alignment" whose URLs
-    # (/research/alignment) are indistinguishable from article slugs.
-    all_links = extract_article_links(page, base_url=feed_url,
-                                      same_domain_only=True)
-    article_links = [l for l in all_links
-                     if (l.get("article_like") or len(l["title"]) >= 40)
-                     and len(l["title"].split()) >= 3]
+    article_links = article_links_on_page(page, feed_url)
 
-    new_articles = []
-    for link in article_links:
-        title = link["title"]
-        article_url = link["url"]
-        c_hash = content_hash(article_url.split("?")[0].rstrip("/").lower())
+    if article_links:
+        items = [_item(l["title"], l["url"]) for l in article_links]
+        logger.info("Source %s: %d items on page", url, len(items))
+        return items
 
-        # Skip duplicates
-        if store.article_exists(c_hash):
-            continue
-
-        new_articles.append({
-            "source_id": source_id,
-            "title": title,
-            "url": article_url,
-            "summary": "",
-            "content_hash": c_hash,
-        })
-        if len(new_articles) >= config.MAX_ARTICLES_PER_FETCH:
-            break  # cap per cycle — avoids flooding summarize on first fetch
-
-    # Strategy 2: no per-entry links found (changelog/update-card pages) —
+    # Strategy 2: no per-entry links (changelog/update-card pages) —
     # extract items from the page content itself via LLM
-    if not article_links:
-        logger.info("No article links on %s — trying inline item extraction", feed_url)
-        inline_items = await _extract_inline_items(feed_url, page)
-        for item in inline_items:
-            if store.article_exists(item["content_hash"]):
-                continue
-            item["source_id"] = source_id
-            new_articles.append(item)
-        if inline_items:
-            logger.info("Inline extraction: %d items from %s", len(inline_items), feed_url)
-
-    logger.info("Source %s: %d new articles", url, len(new_articles))
-    return new_articles
-
-
-async def fetch_all_news() -> dict:
-    """
-    Fetch news from all active sources in parallel.
-    Returns summary: {total_sources, total_new, errors}
-    """
-    sources = store.get_active_sources()
-    logger.info("Fetching news from %d active sources...", len(sources))
-
-    if not sources:
-        return {"total_sources": 0, "total_new": 0, "errors": 0}
-
-    # Fetch in parallel (crawler handles its own semaphore)
-    tasks = [fetch_source_news(s) for s in sources]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    total_new = 0
-    errors = 0
-
-    for source, result in zip(sources, results):
-        if isinstance(result, Exception):
-            logger.error("Error fetching %s: %s", source["url"], result)
-            errors += 1
-            continue
-
-        for article in result:
-            store.add_article(
-                source_id=article["source_id"],
-                title=article["title"],
-                url=article["url"],
-                summary=article.get("summary", ""),
-                content_hash=article["content_hash"],
-            )
-            total_new += 1
-
-    logger.info("Fetch complete: %d new articles from %d sources (%d errors)",
-                total_new, len(sources), errors)
-    return {"total_sources": len(sources), "total_new": total_new, "errors": errors}
+    logger.info("No article links on %s — trying inline item extraction", feed_url)
+    inline_items = await _extract_inline_items(feed_url, page)
+    items = [_item(i["title"], i["url"], i["summary"], i["content_hash"])
+             for i in inline_items]
+    logger.info("Source %s: %d inline items on page", url, len(items))
+    return items
