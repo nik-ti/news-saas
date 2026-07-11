@@ -3,6 +3,7 @@ Telegram bot handlers — all commands and conversation flow.
 Uses python-telegram-bot ConversationHandler for the multi-step /newstream flow.
 """
 import asyncio
+import functools
 import logging
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -30,6 +31,25 @@ logger = logging.getLogger(__name__)
 # ── Conversation state for /newstream ─────────────────────────────────────────
 # A single natural interview loop replaces the old fixed-form states.
 INTERVIEW = 0
+
+
+# ── Authorization ──────────────────────────────────────────────────────────────
+
+def admin_only(handler):
+    """Restrict a command to the operator (config.ADMIN_USER_ID).
+
+    Commands that expose the whole cross-tenant database or drive the pipeline
+    must not be callable by any Telegram user who finds the bot.
+    """
+    @functools.wraps(handler)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        if user is None or user.id != config.ADMIN_USER_ID:
+            await send_rich_async(update.effective_chat.id,
+                                  "❌ This command is restricted to the operator.")
+            return
+        return await handler(update, context)
+    return wrapped
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -180,16 +200,17 @@ async def _run_research_background(stream_id: int, answers: dict, chat_id: int,
     try:
         state = await run_research(answers, stream_id, progress=None)
 
-        # Build the criteria profile into the stream
+        # Persist the profile as the stream's criteria — but keep the user's
+        # own intake conversation inside it. Re-research needs their actual
+        # words; feeding a profile back in as if it were the interview degrades
+        # the rubric a little more on every run.
         if state.get("profile"):
-            conn = get_connection()
-            import json
-            conn.execute(
-                "UPDATE streams SET criteria = ? WHERE id = ?",
-                (json.dumps(state["profile"]), stream_id),
-            )
-            conn.commit()
-            conn.close()
+            profile = state["profile"]
+            if not profile.get("intake_conversation"):
+                profile["intake_conversation"] = (
+                    answers.get("conversation") or ""
+                ) if isinstance(answers, dict) else ""
+            store.update_stream_criteria(stream_id, profile)
 
         store.update_stream_status(stream_id, "active")
 
@@ -293,6 +314,11 @@ async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await send_rich_async(update.effective_chat.id, "Invalid stream ID. Usage: `/sources <stream_id>`")
         return
 
+    owns, stream = await _owns_stream(update.effective_user.id, stream_id)
+    if stream is None or not owns:
+        await send_rich_async(update.effective_chat.id, "❌ That stream isn't yours.")
+        return
+
     sources = store.get_sources_by_stream(stream_id)
 
     if not sources:
@@ -345,8 +371,9 @@ async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # COMMAND: /sources_all
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@admin_only
 async def cmd_sources_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """View the entire source database."""
+    """View the entire source database (operator only — spans all tenants)."""
     sources = store.get_all_sources()
 
     if not sources:
@@ -581,7 +608,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not src:
             await send_rich_async(chat_id, "❌ Source not found.")
             return
-        result = await test_source(src.get("feed_url") or src["url"])
+        # RSS-aware: the browser can false-flag a healthy feed's raw XML.
+        from research.validator import validate_source
+        result = await validate_source(src.get("feed_url") or src["url"])
         if result["fetchable"]:
             store.reactivate_source(source_id)
             await send_rich_async(chat_id, f"✅ `{source_id}` is reachable — reactivated.")
@@ -601,6 +630,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         pending = context.user_data.pop("pending_source", None)
         if not pending:
             await query.edit_message_text("That request expired. Run /addsource again.")
+            return
+        # Telegram can redeliver a callback on lag — don't add the source twice.
+        if store.get_source_by_url(pending["stream_id"], pending["url"]):
+            await query.edit_message_text("That source is already on this stream.")
             return
         source_id = store.add_source(
             stream_id=pending["stream_id"], url=pending["url"],
@@ -642,8 +675,9 @@ marked as errored after a few cycles.\
 # COMMAND: /testsource <url>
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@admin_only
 async def cmd_testsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Test if a URL is fetchable."""
+    """Test if a URL is fetchable (operator only — drives the crawler at will)."""
     if not context.args:
         await send_rich_async(update.effective_chat.id, "Usage: `/testsource <url>`")
         return
@@ -688,9 +722,9 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await send_rich_async(update.effective_chat.id, "Invalid stream ID.")
         return
 
-    stream = store.get_stream(stream_id)
-    if not stream:
-        await send_rich_async(update.effective_chat.id, "❌ Stream not found.")
+    owns, stream = await _owns_stream(update.effective_user.id, stream_id)
+    if stream is None or not owns:
+        await send_rich_async(update.effective_chat.id, "❌ That stream isn't yours.")
         return
 
     store.update_stream_status(stream_id, "researching")
@@ -698,10 +732,20 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     chat_id = update.effective_chat.id
 
-    async def progress(msg: str):
-        await send_rich_async(chat_id, msg)
+    # Rebuild the research input from the user's ORIGINAL intake conversation
+    # when we have it. criteria is a generated profile after the first run —
+    # passing that back in as if it were the interview compounds drift.
+    criteria = stream.get("criteria") or {}
+    convo = ""
+    if isinstance(criteria, dict):
+        convo = (criteria.get("intake_conversation")
+                 or criteria.get("conversation") or "")
+    if convo:
+        answers = {"topic": stream.get("name") or "", "conversation": convo}
+    else:
+        answers = criteria  # legacy stream from before intake preservation
 
-    asyncio.create_task(_run_research_background(stream_id, stream["criteria"], chat_id, context))
+    asyncio.create_task(_run_research_background(stream_id, answers, chat_id, context))
 
     await send_rich_async(update.effective_chat.id, "Research started in background. I'll update you with results.")
 
@@ -711,8 +755,8 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show latest fetched articles."""
-    articles = store.get_latest_articles(limit=15)
+    """Show the caller's latest fetched articles (their streams only)."""
+    articles = store.get_latest_articles_for_user(update.effective_user.id, limit=15)
 
     if not articles:
         await send_rich_async(update.effective_chat.id, "📭 No articles fetched yet.")
@@ -734,8 +778,9 @@ async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # COMMAND: /runpipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@admin_only
 async def cmd_runpipeline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manually run the same news cycle the cron runs."""
+    """Manually run the same news cycle the cron runs (operator only)."""
     chat_id = update.effective_chat.id
 
     await send_rich_async(chat_id, "▶️ Running the news cycle...")
@@ -761,8 +806,9 @@ async def cmd_runpipeline(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # COMMAND: /status
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@admin_only
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show system status."""
+    """Show system status (operator only — spans all tenants)."""
     from database.models import get_connection
     conn = get_connection()
 

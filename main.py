@@ -39,7 +39,7 @@ from bot.handlers import (
     # Inline button router
     handle_callback,
 )
-from bot.messaging import send_rich
+from bot.messaging import send_rich, send_rich_async
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -80,7 +80,9 @@ async def cron_health_check(context):
     perfectly readable later. Leaving 'blocked' out would strand it forever.
     """
     from database import store
-    from crawler.fetcher import test_source
+    # validate_source is RSS-aware: raw XML fed to the browser can false-flag a
+    # perfectly healthy feed as blocked, stranding it in 'error' forever.
+    from research.validator import validate_source
     logger.info("CRON: Health check...")
 
     from database.models import get_connection
@@ -94,26 +96,75 @@ async def cron_health_check(context):
     reactivated = 0
     for row in rows:
         # Test the page the pipeline actually crawls, one at a time.
-        result = await test_source(row["feed_url"] or row["url"])
+        result = await validate_source(row["feed_url"] or row["url"])
         if result["fetchable"]:
             store.reactivate_source(row["id"])
             reactivated += 1
         await asyncio.sleep(1)
 
     if reactivated > 0:
-        send_rich(config.TELEGRAM_CHAT_ID,
-                  f"🔧 **Health Check:** Reactivated {reactivated} source(s).")
+        await send_rich_async(config.TELEGRAM_CHAT_ID,
+                              f"🔧 **Health Check:** Reactivated {reactivated} source(s).")
 
     logger.info("CRON: Health check — reactivated %d/%d", reactivated, len(rows))
+
+
+async def startup_selfcheck(context):
+    """
+    Ping every external dependency once at boot and tell the admin what's broken.
+
+    A wrong model name, an expired search key, or a dead embeddings endpoint
+    otherwise degrades silently — research 'finds nothing' and nobody knows why.
+    """
+    import config as cfg
+    from research.llm import chat, chat_post
+    from research.embeddings import embed
+    from research.discovery import _brave_search
+
+    problems = []
+
+    try:
+        await chat("Reply with the word OK.", "ping")
+    except Exception as e:
+        problems.append(f"❌ fast LLM (`{cfg.LLM_MODEL_FAST}`): {e}")
+    try:
+        await chat_post("Reply with the word OK.", "ping")
+    except Exception as e:
+        problems.append(f"❌ post LLM (`{cfg.LLM_MODEL_POST}`): {e}")
+
+    if await embed("selfcheck") is None:
+        problems.append("⚠️ embeddings endpoint failing — semantic source DB inactive")
+
+    brave = await _brave_search("news", count=1)
+    if brave is None:
+        problems.append("❌ Brave Search errored on a trivial query — check key/quota")
+    elif not brave:
+        problems.append("⚠️ Brave Search returned zero results for 'news'")
+
+    if problems:
+        logger.error("Startup self-check found problems: %s", problems)
+        await send_rich_async(config.ADMIN_USER_ID,
+                              "# 🩺 Startup self-check\n\n" + "\n".join(problems))
+    else:
+        logger.info("Startup self-check: all external dependencies OK")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Application factory
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _post_shutdown(app: Application) -> None:
+    """Close the shared headless browser so restarts don't orphan Chromium."""
+    from crawler.fetcher import shutdown_crawler
+    await shutdown_crawler()
+
+
 def build_application() -> Application:
     """Build and configure the Telegram bot application."""
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    app = (Application.builder()
+           .token(config.TELEGRAM_BOT_TOKEN)
+           .post_shutdown(_post_shutdown)
+           .build())
 
     # ── Conversation handler for /newstream ───────────────────────────────
     newstream_conv = ConversationHandler(
@@ -176,6 +227,9 @@ def setup_scheduler(app: Application) -> None:
         first=config.HEALTH_CHECK_INTERVAL_HOURS * 3600,
         name="health_check",
     )
+
+    # One-shot dependency self-check shortly after boot
+    job_queue.run_once(startup_selfcheck, when=15, name="startup_selfcheck")
 
     logger.info("Scheduler configured: news_cycle=%dmin (max %d/source, %d posts/cycle), health=%dh",
                 config.NEWS_CYCLE_MINUTES, config.MAX_NEW_PER_SOURCE,
