@@ -95,8 +95,8 @@ async def node_build_profile(state: ResearchState,
     state["profile"] = profile
 
     await progress(
-        f"✅ Profile ready: **{profile.get('broad_domain', '?')}** — "
-        f"{len(profile.get('keywords', []))} keywords"
+        f"✅ Profile ready: **{profile.get('broad_domain') or '?'}** — "
+        f"{len(profile.get('keywords') or [])} keywords"
     )
     return state
 
@@ -211,6 +211,9 @@ def _feed_url_of(q: dict) -> str:
 
 def _fetch_method_of(q: dict) -> str:
     """The proven way to read this source, so the poller needn't re-guess."""
+    # Feed repair may have already determined the method from a verified page.
+    if q.get("fetch_method"):
+        return q["fetch_method"]
     from pipeline.fetch_news import RSS_URL_HINTS
     feed = _feed_url_of(q).lower()
     if any(h in feed for h in RSS_URL_HINTS):
@@ -235,24 +238,37 @@ def _to_source_dict(q: dict, fetch_status: str = "active") -> dict:
 
 async def node_validate(state: ResearchState,
                          progress: ProgressCallback = None) -> ResearchState:
-    """Phase 4: Validate top sources with crawl4ai.
+    """Phase 4: Repair each top source's feed_url, then validate what's left.
 
-    Validates the feed_url (the page the pipeline will actually crawl),
-    not just the homepage.
+    Repair must run BEFORE the validation filter: a good publication whose
+    qualifier-LLM named a wrong feed_url would otherwise fail validation and be
+    discarded — the exact sources the repair exists to save. A repair that
+    proves a page (crawls it and counts its articles) IS a validation, so those
+    sources skip the second crawl entirely.
     """
     progress = progress or _noop
-    # Take top N qualified sources
+    state["log"].append("Phase 4: Feed repair + validation")
+
     top = state["qualified"][:config.DESIRED_SOURCES_MAX]
-    urls = list({_feed_url_of(q) for q in top})
+    if top:
+        await progress(f"🔧 Confirming each of {len(top)} sources' news pages...")
+        top = list(await asyncio.gather(*(_repair_feed_url(q) for q in top)))
+        state["qualified"][:config.DESIRED_SOURCES_MAX] = top
 
-    await progress(f"🌐 Testing {len(urls)} feed pages with web crawler...")
-    state["log"].append("Phase 4: Validation")
+    proven = {_feed_url_of(q) for q in top if q.get("_feed_verified")}
+    to_check = list({_feed_url_of(q) for q in top} - proven)
 
-    validated = await validate_sources(urls)
+    validated = []
+    if to_check:
+        await progress(f"🌐 Testing {len(to_check)} feed pages with web crawler...")
+        validated = await validate_sources(to_check)
+    validated += [{"url": u, "fetchable": True, "status": "active",
+                   "title": "", "content_preview": "", "error": None}
+                  for u in proven]
     state["validated"] = validated
 
     fetchable = [v for v in validated if v["fetchable"]]
-    await progress(f"✅ Validation: {len(fetchable)}/{len(urls)} sources are fetchable")
+    await progress(f"✅ Validation: {len(fetchable)}/{len(validated)} sources are fetchable")
     return state
 
 
@@ -262,14 +278,30 @@ async def _repair_feed_url(src: dict) -> dict:
     verify: if that page doesn't actually expose articles, fall back to the
     deterministic finder. A source whose feed_url is a marketing homepage would
     silently never produce news.
+
+    Sets src["_feed_verified"] = True when the page was PROVEN to list articles
+    (either the LLM's URL checked out, or the finder returned a verified page),
+    so validation doesn't have to crawl it again.
     """
     from crawler.fetcher import fetch_page
-    from pipeline.fetch_news import article_links_on_page
+    from pipeline.fetch_news import (RSS_URL_HINTS, article_links_on_page,
+                                     fetch_rss_items)
     from research.feed_finder import find_news_pages, MIN_ARTICLE_LINKS
 
     feed_url = src.get("feed_url") or src["url"]
+
+    # An RSS feed_url proves itself with one cheap HTTP GET — pointing the
+    # browser at raw XML would find zero "article links" and wrongly repair it.
+    if any(h in feed_url.lower() for h in RSS_URL_HINTS):
+        if await fetch_rss_items(feed_url):
+            src["_feed_verified"] = True
+            src["fetch_method"] = "rss"
+            return src
+
     page = await fetch_page(feed_url)
     if page["success"] and len(article_links_on_page(page, feed_url)) >= MIN_ARTICLE_LINKS:
+        src["_feed_verified"] = True
+        src.setdefault("fetch_method", "links")
         return src  # the LLM was right
 
     logger.info("feed_url %s exposes too few articles — rediscovering", feed_url)
@@ -283,6 +315,8 @@ async def _repair_feed_url(src: dict) -> dict:
         logger.info("Repaired feed_url for %s: %s → %s",
                     src["url"], feed_url, candidates[0].url)
         src["feed_url"] = candidates[0].url
+        src["fetch_method"] = "rss" if candidates[0].kind == "feed" else "links"
+        src["_feed_verified"] = True
     return src
 
 
@@ -315,11 +349,6 @@ async def node_finalize(state: ResearchState,
                 final.append(_to_source_dict(q))
             if len(final) >= config.DESIRED_SOURCES_MIN:
                 break
-
-    # Make sure each source's feed_url is a page that really lists articles.
-    if final:
-        await progress("🔧 Confirming each source's news page...")
-        final = list(await asyncio.gather(*(_repair_feed_url(s) for s in final)))
 
     state["final_sources"] = final
     await progress(f"🎯 Final result: {len(final)} validated sources ready")
@@ -408,10 +437,13 @@ async def _add_google_news_source(stream_id: int, profile: dict,
     query = news_query_for(profile)
     feed_url = google_news_feed_url(query)
 
-    # Key on a stable site URL so re-research doesn't add duplicates.
-    site_url = f"https://news.google.com/search?q={query}"
-    if store.get_source_by_url(stream_id, site_url):
+    # One Google News feed per stream, ever. Re-research regenerates the profile
+    # and shifts the query text, so keying on the query-bearing URL would add a
+    # duplicate aggregator on every re-run.
+    if any("news.google.com" in ((s.get("feed_url") or "").lower())
+           for s in store.get_sources_by_stream(stream_id)):
         return
+    site_url = f"https://news.google.com/search?q={query}"
 
     items = await fetch_rss_items(feed_url)
     if not items:

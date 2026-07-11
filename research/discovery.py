@@ -48,19 +48,22 @@ async def generate_search_queries(profile: dict, n: int = None) -> list[str]:
         f"Generate {n} varied search queries as JSON.",
     )
 
-    queries = result.get("queries", [])
+    queries = result.get("queries") or []
     if not queries:
-        # Fallback: use keywords directly
-        queries = profile.get("keywords", [profile.get("broad_domain", "news")])[:n]
+        # Fallback: use keywords directly. `or` (not .get defaults): the LLM can
+        # emit these keys as null, and slicing None crashes the whole research run.
+        queries = (profile.get("keywords")
+                   or [profile.get("broad_domain") or "news"])[:n]
 
     logger.info("Generated %d search queries", len(queries))
     return queries[:n]
 
 
-async def _brave_search(query: str, count: int = None) -> list[dict]:
+async def _brave_search(query: str, count: int = None) -> list[dict] | None:
     """
     Execute a single Brave Search query using direct API.
-    Returns list of {title, url, description}.
+    Returns list of {title, url, description}; None means the request ERRORED
+    (bad key, quota, timeout) as opposed to genuinely finding nothing.
     """
     count = count or config.MAX_CANDIDATES_PER_QUERY
     async with _search_semaphore:
@@ -95,7 +98,7 @@ async def _brave_search(query: str, count: int = None) -> list[dict]:
                 return candidates
         except Exception as e:
             logger.error("Brave search failed for '%s': %s", query, e)
-            return []
+            return None
 
 
 async def search_parallel(queries: list[str]) -> list[str]:
@@ -111,12 +114,19 @@ async def search_parallel(queries: list[str]) -> list[str]:
     tasks = [_brave_search(q) for q in queries]
     all_results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    # An expired key or exhausted quota must FAIL LOUDLY. Silently returning
+    # zero candidates reads as "no sources exist for this topic" and sends the
+    # user (and the operator) debugging the wrong thing.
+    succeeded = [r for r in all_results if isinstance(r, list)]
+    if queries and not succeeded:
+        raise RuntimeError(
+            "Brave Search failed for every query — check BRAVE_SEARCH_API_KEY / quota"
+        )
+
     # domain -> best candidate URL (prefer shallowest path)
     by_domain: dict[str, str] = {}
 
-    for result in all_results:
-        if isinstance(result, Exception):
-            continue
+    for result in succeeded:
         for item in result:
             raw_url = item["url"]
             if not _is_valid_candidate(raw_url):

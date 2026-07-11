@@ -153,10 +153,12 @@ async def qualify_all(candidates: list[str], profile: dict,
             f"Evaluate each source. Output JSON.",
         )
 
-        for r in result.get("results", []):
+        for r in result.get("results") or []:
+            if not isinstance(r, dict):
+                continue
             src_id = r.get("id")
-            score = r.get("score", 0)
-            verdict = r.get("verdict", "skip")
+            score = r.get("score") or 0   # the LLM can emit "score": null
+            verdict = r.get("verdict") or "skip"
             if verdict == "investigate" and src_id in url_to_index:
                 promising[src_id] = score
 
@@ -196,11 +198,11 @@ async def qualify_all(candidates: list[str], profile: dict,
             continue
         if result is None:
             continue
-        if result.get("match_score", 0) >= threshold and \
+        if (result.get("match_score") or 0) >= threshold and \
            result.get("recommendation") in ("accept", "borderline"):
             qualified.append(result)
 
-    qualified.sort(key=lambda x: x.get("match_score", 0), reverse=True)
+    qualified.sort(key=lambda x: x.get("match_score") or 0, reverse=True)
 
     logger.info("Stage 2 complete: %d/%d sources qualified (threshold=%d)",
                 len(qualified), len(deep_candidates), threshold)
