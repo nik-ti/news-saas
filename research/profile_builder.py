@@ -104,7 +104,7 @@ async def interview_turn(transcript: list[dict]) -> dict:
     result = await chat_json(
         SYSTEM_PROMPT_INTERVIEW,
         f"Conversation so far:\n\n{convo}\n\n{instruction}",
-        smart=True,
+        model="smart",
     )
 
     # Robust fallbacks — never leave the user stuck mid-conversation.
@@ -179,7 +179,7 @@ async def build_relevance_rubric(answers: dict, profile: dict) -> str:
             SYSTEM_PROMPT_RUBRIC,
             f"Intake conversation and derived profile:\n\n{payload}\n\n"
             "Write the relevance rubric.",
-            smart=True,
+            model="smart",
         )
     except Exception as e:
         logger.error("Rubric generation failed: %s", e)
@@ -200,7 +200,7 @@ async def build_profile(answers: dict) -> dict:
         SYSTEM_PROMPT_PROFILE,
         f"Here is the full intake conversation:\n\n{answers_text}\n\n"
         "Generate the Source Criteria Profile as JSON.",
-        smart=True,
+        model="smart",
     )
 
     if not profile:

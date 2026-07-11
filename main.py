@@ -117,7 +117,7 @@ async def startup_selfcheck(context):
     otherwise degrades silently — research 'finds nothing' and nobody knows why.
     """
     import config as cfg
-    from research.llm import chat, chat_post
+    from research.llm import chat
     from research.embeddings import embed
     from research.discovery import _brave_search
 
@@ -128,7 +128,7 @@ async def startup_selfcheck(context):
     except Exception as e:
         problems.append(f"❌ fast LLM (`{cfg.LLM_MODEL_FAST}`): {e}")
     try:
-        await chat_post("Reply with the word OK.", "ping")
+        await chat("Reply with the word OK.", "ping", model="post")
     except Exception as e:
         problems.append(f"❌ post LLM (`{cfg.LLM_MODEL_POST}`): {e}")
 

@@ -1,5 +1,56 @@
-"""F8 — Telegram HTML sanitizer and safe truncation."""
+"""F8 — Telegram HTML sanitizer and safe truncation. C5 — unified transport."""
+import bot.messaging as msg
 from bot.messaging import sanitize_telegram_html, _safe_truncate
+
+
+# ── C5: _api transport ────────────────────────────────────────────────────────
+
+class _FakeResponse:
+    def __init__(self, data):
+        self._data = data
+
+    def json(self):
+        return self._data
+
+
+class _FakeClient:
+    def __init__(self, data):
+        self.data = data
+        self.calls = []
+
+    async def post(self, url, json=None):
+        self.calls.append((url, json))
+        return _FakeResponse(self.data)
+
+
+async def test_api_posts_method_and_returns_payload(monkeypatch):
+    client = _FakeClient({"ok": True, "result": {"message_id": 7}})
+    monkeypatch.setattr(msg, "_get_client", lambda: client)
+
+    data = await msg._api("sendMessage", {"chat_id": 1, "text": "hi"})
+    assert data["ok"] is True
+    url, payload = client.calls[0]
+    assert url.endswith("/sendMessage")
+    assert payload == {"chat_id": 1, "text": "hi"}
+
+
+async def test_api_returns_error_payload_without_raising(monkeypatch):
+    client = _FakeClient({"ok": False, "error_code": 400, "description": "bad"})
+    monkeypatch.setattr(msg, "_get_client", lambda: client)
+
+    data = await msg._api("sendMessage", {"chat_id": 1, "text": "x"})
+    assert data["error_code"] == 400   # caller decides; no exception
+
+
+async def test_send_html_message_routes_through_api(monkeypatch):
+    client = _FakeClient({"ok": True})
+    monkeypatch.setattr(msg, "_get_client", lambda: client)
+
+    await msg.send_html_message_async(5, "<b>post</b> & Yield <6%")
+    url, payload = client.calls[0]
+    assert url.endswith("/sendMessage")
+    assert payload["text"] == "<b>post</b> & Yield &lt;6%"   # sanitized in transit
+    assert payload["parse_mode"] == "HTML"
 
 
 # ── sanitize_telegram_html ────────────────────────────────────────────────────

@@ -140,19 +140,24 @@ async def qualify_all(candidates: list[str], profile: dict,
 
     promising = {}  # id -> score
     chunk_size = 15
+    profile_json = json.dumps(profile, indent=2)
 
-    for chunk_start in range(0, len(sources_for_llm), chunk_size):
-        chunk = sources_for_llm[chunk_start:chunk_start + chunk_size]
-        profile_json = json.dumps(profile, indent=2)
-        sources_json = json.dumps(chunk, indent=2)
-
-        result = await chat_json(
+    chunks = [sources_for_llm[i:i + chunk_size]
+              for i in range(0, len(sources_for_llm), chunk_size)]
+    chunk_results = await asyncio.gather(*(
+        chat_json(
             SYSTEM_PROMPT_BATCH_PREFILTER,
             f"## Source Criteria Profile\n{profile_json}\n\n"
-            f"## Candidate Sources ({len(chunk)})\n{sources_json}\n\n"
+            f"## Candidate Sources ({len(chunk)})\n{json.dumps(chunk, indent=2)}\n\n"
             f"Evaluate each source. Output JSON.",
         )
+        for chunk in chunks), return_exceptions=True)
 
+    for result in chunk_results:
+        if isinstance(result, Exception):
+            # One failed chunk loses only its own candidates, loudly.
+            logger.error("Prefilter chunk failed: %s", result)
+            continue
         for r in result.get("results") or []:
             if not isinstance(r, dict):
                 continue
@@ -248,7 +253,7 @@ async def _deep_qualify_single(url: str, profile: dict, homepage: dict) -> Optio
             f"## Source Criteria Profile\n\n{profile_json}\n\n"
             f"## Candidate Source Content\n\n{content_for_llm}\n\n"
             f"Evaluate this source and identify its feed_url. Output JSON.",
-            smart=True,
+            model="smart",
         )
 
         if not result:

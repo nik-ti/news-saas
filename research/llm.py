@@ -4,7 +4,6 @@ Provides async chat completions for the research engine and pipeline.
 """
 import json
 import logging
-from typing import Optional
 
 from langchain_openai import ChatOpenAI
 
@@ -12,55 +11,31 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# ── LLM instances (singleton) ─────────────────────────────────────────────────
-_llm_fast: Optional[ChatOpenAI] = None
-_llm_smart: Optional[ChatOpenAI] = None
-_llm_post: Optional[ChatOpenAI] = None
+# ── LLM instances ─────────────────────────────────────────────────────────────
+# One spec table, one lazy cache. Adding a model (fact-check tier, premium
+# crawler…) is a dict entry, not a fourth copy-pasted singleton.
+
+# kind -> (model id, temperature, timeout seconds)
+_LLM_SPECS = {
+    "fast": (config.LLM_MODEL_FAST, config.LLM_TEMPERATURE, 30),
+    "smart": (config.LLM_MODEL_SMART, config.LLM_TEMPERATURE, 60),
+    "post": (config.LLM_MODEL_POST, 0.2, 30),
+}
+_llms: dict[str, ChatOpenAI] = {}
 
 
-def get_llm_fast() -> ChatOpenAI:
-    """Fast/cheap LLM for simple tasks (query generation, summaries)."""
-    global _llm_fast
-    if _llm_fast is None:
-        _llm_fast = ChatOpenAI(
-            model=config.LLM_MODEL_FAST,
+def _get_llm(kind: str) -> ChatOpenAI:
+    if kind not in _llms:
+        model, temperature, timeout = _LLM_SPECS[kind]
+        _llms[kind] = ChatOpenAI(
+            model=model,
             openai_api_key=config.OPENROUTER_API_KEY,
             openai_api_base=config.OPENROUTER_BASE_URL,
-            temperature=config.LLM_TEMPERATURE,
-            timeout=30,
+            temperature=temperature,
+            timeout=timeout,
             max_retries=2,
         )
-    return _llm_fast
-
-
-def get_llm_smart() -> ChatOpenAI:
-    """Smart LLM for complex reasoning (qualification, profile building)."""
-    global _llm_smart
-    if _llm_smart is None:
-        _llm_smart = ChatOpenAI(
-            model=config.LLM_MODEL_SMART,
-            openai_api_key=config.OPENROUTER_API_KEY,
-            openai_api_base=config.OPENROUTER_BASE_URL,
-            temperature=config.LLM_TEMPERATURE,
-            timeout=60,
-            max_retries=2,
-        )
-    return _llm_smart
-
-
-def get_llm_post() -> ChatOpenAI:
-    """Cheap LLM for post writing (Gemini Flash)."""
-    global _llm_post
-    if _llm_post is None:
-        _llm_post = ChatOpenAI(
-            model=config.LLM_MODEL_POST,
-            openai_api_key=config.OPENROUTER_API_KEY,
-            openai_api_base=config.OPENROUTER_BASE_URL,
-            temperature=0.2,
-            timeout=30,
-            max_retries=2,
-        )
-    return _llm_post
+    return _llms[kind]
 
 
 async def _openrouter_embeddings(model: str, inputs: list[str]) -> list[list[float]]:
@@ -84,42 +59,26 @@ async def _openrouter_embeddings(model: str, inputs: list[str]) -> list[list[flo
     return [row["embedding"] for row in rows]
 
 
-async def chat(system_prompt: str, user_prompt: str, smart: bool = False) -> str:
+async def chat(system_prompt: str, user_prompt: str, model: str = "fast") -> str:
     """
     Simple async chat call. Returns the text response.
+    `model` picks the tier: "fast" | "smart" | "post".
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    llm = get_llm_smart() if smart else get_llm_fast()
-    messages = [
+    response = await _get_llm(model).ainvoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_prompt),
-    ]
-    response = await llm.ainvoke(messages)
+    ])
     return response.content
 
 
-async def chat_post(system_prompt: str, user_prompt: str) -> str:
-    """
-    Chat call using the post-writing LLM (cheap model, e.g. Gemini Flash).
-    """
-    from langchain_core.messages import HumanMessage, SystemMessage
-
-    llm = get_llm_post()
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=user_prompt),
-    ]
-    response = await llm.ainvoke(messages)
-    return response.content
-
-
-async def chat_json(system_prompt: str, user_prompt: str, smart: bool = False) -> dict:
+async def chat_json(system_prompt: str, user_prompt: str, model: str = "fast") -> dict:
     """
     Async chat call that expects a JSON response.
     Strips markdown fences and parses.
     """
-    raw = await chat(system_prompt, user_prompt, smart=smart)
+    raw = await chat(system_prompt, user_prompt, model=model)
     return parse_json_response(raw)
 
 

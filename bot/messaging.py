@@ -82,11 +82,34 @@ def _safe_truncate(html: str, limit: int = 4096) -> str:
     return cut
 
 
-# ── Sync versions ─────────────────────────────────────────────────────────────
-# Use ONLY outside PTB async handlers (standalone alerters, background threads, cron).
+# ── Transport ─────────────────────────────────────────────────────────────────
+# One shared AsyncClient (connection reuse — a client per message pays a full
+# TLS handshake every time) and one place that POSTs and logs failures.
+
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(timeout=30)
+    return _client
+
+
+async def _api(method: str, payload: dict) -> dict:
+    """POST one Bot API method. Returns the parsed response, logging failures."""
+    resp = await _get_client().post(f"{API_BASE}/{method}", json=payload)
+    data = resp.json()
+    if not data.get("ok"):
+        logger.error("%s failed: %s", method, data)
+    return data
+
+
+# ── Sync version ──────────────────────────────────────────────────────────────
+# Use ONLY outside the event loop (startup message in main(), before run_webhook).
 
 def send_rich(chat_id: int, markdown: str, extra_html: str = "") -> dict:
-    """Markdown → Rich HTML → sendRichMessage. For outbound alerts."""
+    """Markdown → Rich HTML → sendRichMessage. For pre-event-loop alerts."""
     base_html = richify(markdown).to_dict().get("html", "")
     resp = httpx.post(
         f"{API_BASE}/sendRichMessage",
@@ -99,52 +122,16 @@ def send_rich(chat_id: int, markdown: str, extra_html: str = "") -> dict:
     return data
 
 
-def send_rich_html(chat_id: int, html: str) -> dict:
-    """Raw Rich HTML → sendRichMessage. For <details>, <sub>, <sup>."""
-    resp = httpx.post(
-        f"{API_BASE}/sendRichMessage",
-        json={"chat_id": chat_id, "rich_message": {"html": html}},
-        timeout=30,
-    )
-    data = resp.json()
-    if not data.get("ok"):
-        logger.error("sendRichMessage failed: %s", data)
-    return data
-
-
 # ── Async versions ────────────────────────────────────────────────────────────
-# Use inside PTB async handlers (cmd_*, handle_callback, etc.).
+# Use inside PTB async handlers (cmd_*, handle_callback, cron jobs).
 
 async def send_rich_async(chat_id: int, markdown: str, extra_html: str = "") -> dict:
     """Async markdown → Rich HTML → sendRichMessage. For use inside PTB handlers."""
     base_html = richify(markdown).to_dict().get("html", "")
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{API_BASE}/sendRichMessage",
-            json={"chat_id": chat_id, "rich_message": {"html": base_html + extra_html}},
-            timeout=30,
-        )
-    data = resp.json()
-    if not data.get("ok"):
-        logger.error("sendRichMessage failed: %s", data)
-    return data
+    return await _api("sendRichMessage",
+                      {"chat_id": chat_id,
+                       "rich_message": {"html": base_html + extra_html}})
 
-
-async def send_rich_html_async(chat_id: int, html: str) -> dict:
-    """Async raw Rich HTML → sendRichMessage. For PTB handlers with <details> etc."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{API_BASE}/sendRichMessage",
-            json={"chat_id": chat_id, "rich_message": {"html": html}},
-            timeout=30,
-        )
-    data = resp.json()
-    if not data.get("ok"):
-        logger.error("sendRichMessage failed: %s", data)
-    return data
-
-
-# ── News posts ────────────────────────────────────────────────────────────────
 
 async def send_html_message_async(chat_id: int, html: str,
                                   reply_markup: dict | None = None) -> dict:
@@ -161,10 +148,4 @@ async def send_html_message_async(chat_id: int, html: str,
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(f"{API_BASE}/sendMessage", json=payload, timeout=30)
-    data = resp.json()
-    if not data.get("ok"):
-        logger.error("sendMessage failed: %s", data)
-    return data
+    return await _api("sendMessage", payload)

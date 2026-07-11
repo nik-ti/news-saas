@@ -3,9 +3,9 @@ import pipeline.post_writer as pw
 
 
 async def test_source_url_is_escaped(monkeypatch):
-    async def fake_llm(system, user):
+    async def fake_llm(system, user, model="post"):
         return "<b>Headline</b>\n\nBody text."
-    monkeypatch.setattr(pw, "chat_post", fake_llm)
+    monkeypatch.setattr(pw, "chat", fake_llm)
 
     hostile = 'https://x.com/a"b<c>&d'
     post = await pw.write_post("summary", title="T", source_url=hostile)
@@ -16,9 +16,9 @@ async def test_source_url_is_escaped(monkeypatch):
 
 
 async def test_clean_url_passes_through(monkeypatch):
-    async def fake_llm(system, user):
+    async def fake_llm(system, user, model="post"):
         return "<b>Headline</b>\n\nBody."
-    monkeypatch.setattr(pw, "chat_post", fake_llm)
+    monkeypatch.setattr(pw, "chat", fake_llm)
 
     post = await pw.write_post("summary", source_url="https://x.com/story")
     assert '<a href="https://x.com/story">Source</a>' in post

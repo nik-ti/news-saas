@@ -7,7 +7,7 @@ import html as html_mod
 import logging
 
 import config
-from research.llm import chat_post
+from research.llm import chat
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ async def write_post(summary_text: str, title: str = "", source_url: str = "",
     prompt = "\n\n".join(parts)
 
     try:
-        raw = await chat_post(system, prompt)
+        raw = await chat(system, prompt, model="post")
     except Exception as e:
         logger.error("Post writer error: %s", e)
         return ""
