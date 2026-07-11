@@ -51,6 +51,18 @@ async def run_news_cycle() -> dict:
 
 # ── Phase A ───────────────────────────────────────────────────────────────────
 
+def _looks_like_rebaseline(n_fresh: int, n_total: int) -> bool:
+    """
+    A wholesale change — site redesign, URL scheme change, feed regenerated —
+    makes (nearly) EVERY item on a known source look new at once. Delivering
+    those would spam the user with stale articles for days. Treat it as a
+    re-baseline, not news.
+    """
+    if n_total <= 0 or n_fresh < config.REBASELINE_MIN_ITEMS:
+        return False
+    return n_fresh / n_total >= config.REBASELINE_FRACTION
+
+
 async def _baseline_and_fetch_phase() -> tuple[int, int]:
     """Snapshot every active source; baseline new ones, queue genuinely new articles."""
     sources = store.get_active_sources()
@@ -62,20 +74,44 @@ async def _baseline_and_fetch_phase() -> tuple[int, int]:
         *(snapshot_source(s) for s in sources), return_exceptions=True
     )
 
+    # Circuit breaker: when most sources fail in the same cycle the cause is
+    # ours (dead browser, network outage), not theirs. Counting it against
+    # individual sources would mass-deactivate the whole system in 3 cycles.
+    failures = sum(1 for s in snapshots if isinstance(s, Exception))
+    systemic = len(sources) >= 4 and failures > len(sources) // 2
+    if systemic:
+        logger.error(
+            "news_cycle: %d/%d sources failed — systemic failure, resetting the "
+            "crawler and NOT counting this cycle against individual sources",
+            failures, len(sources),
+        )
+        from crawler.fetcher import _reset_crawler
+        await _reset_crawler()
+
     baselined = 0
     queued = 0
+    # Dedup is per stream (see store.stream_seen_hashes) — one query per
+    # stream per cycle instead of one per link.
+    seen_by_stream: dict[int, set[str]] = {}
 
     for source, snapshot in zip(sources, snapshots):
         source_id = source["id"]
 
         if isinstance(snapshot, Exception):
-            _record_fetch_failure(source, snapshot)
+            if not systemic:
+                _record_fetch_failure(source, snapshot)
             continue
 
         store.update_source_fetch_time(source_id)
         store.reset_fail_count(source_id)
 
-        fresh = [i for i in snapshot if not store.article_exists(i["content_hash"])]
+        stream_id = source["stream_id"]
+        if stream_id not in seen_by_stream:
+            seen_by_stream[stream_id] = store.stream_seen_hashes(stream_id)
+        seen = seen_by_stream[stream_id]
+
+        fresh = [i for i in snapshot if i["content_hash"] not in seen]
+        seen.update(i["content_hash"] for i in fresh)  # intra-cycle dedup too
 
         # First time we've ever polled this source: record what's already there
         # so it is never mistaken for news, and send nothing.
@@ -90,6 +126,22 @@ async def _baseline_and_fetch_phase() -> tuple[int, int]:
             baselined += 1
             logger.info("Baselined source %s — %d existing articles marked seen, "
                         "0 posted", source["url"], len(fresh))
+            continue
+
+        # A known source where (nearly) everything is suddenly "new" changed
+        # its page structure, not its news. Re-baseline silently.
+        if _looks_like_rebaseline(len(fresh), len(snapshot)):
+            for item in fresh:
+                store.add_article(
+                    source_id=source_id, title=item["title"], url=item["url"],
+                    summary=item["summary"], content_hash=item["content_hash"],
+                    status="seen",
+                )
+            logger.warning(
+                "Source %s: %d/%d items suddenly new — page structure changed, "
+                "re-baselined instead of posting", source["url"],
+                len(fresh), len(snapshot),
+            )
             continue
 
         for item in fresh[:config.MAX_NEW_PER_SOURCE]:

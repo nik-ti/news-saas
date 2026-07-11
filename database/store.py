@@ -275,25 +275,37 @@ def add_article(
 ) -> int:
     conn = get_connection()
     cur = conn.cursor()
+    # OR IGNORE: UNIQUE(source_id, content_hash) makes a duplicate insert a no-op
+    # instead of a crash, so racing writers can't double-record an article.
     cur.execute(
-        """INSERT INTO articles
+        """INSERT OR IGNORE INTO articles
            (source_id, title, url, summary, relevance_score, status, content_hash)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (source_id, title, url, summary, relevance_score, status, content_hash),
     )
     conn.commit()
-    article_id = cur.lastrowid
+    article_id = cur.lastrowid if cur.rowcount else 0
     conn.close()
     return article_id
 
 
-def article_exists(content_hash: str) -> bool:
+def stream_seen_hashes(stream_id: int) -> set[str]:
+    """
+    All content hashes this STREAM has ever recorded, from any of its sources.
+
+    Dedup is per stream: two streams following overlapping sources must EACH
+    receive an article, while two sources inside one stream (e.g. Google News +
+    the publisher directly) must not deliver it twice.
+    """
     conn = get_connection()
-    row = conn.execute(
-        "SELECT 1 FROM articles WHERE content_hash = ? LIMIT 1", (content_hash,)
-    ).fetchone()
+    rows = conn.execute(
+        """SELECT a.content_hash FROM articles a
+           JOIN sources s ON a.source_id = s.id
+           WHERE s.stream_id = ?""",
+        (stream_id,),
+    ).fetchall()
     conn.close()
-    return row is not None
+    return {r["content_hash"] for r in rows if r["content_hash"]}
 
 
 def get_new_articles() -> list[dict]:
@@ -412,13 +424,16 @@ def mark_articles_delivered(article_ids: list[int]) -> None:
     conn.close()
 
 
-def get_latest_articles(limit: int = 20) -> list[dict]:
+def get_latest_articles_for_user(user_id: int, limit: int = 20) -> list[dict]:
+    """Latest articles across THIS user's streams only (tenant-scoped)."""
     conn = get_connection()
     rows = conn.execute(
         """SELECT a.*, s.name as source_name, s.url as source_url FROM articles a
            JOIN sources s ON a.source_id = s.id
+           JOIN streams st ON s.stream_id = st.id
+           WHERE st.user_id = ?
            ORDER BY a.fetched_at DESC LIMIT ?""",
-        (limit,),
+        (user_id, limit),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]

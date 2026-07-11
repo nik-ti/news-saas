@@ -15,33 +15,56 @@ logger = logging.getLogger(__name__)
 # ── Concurrency control ───────────────────────────────────────────────────────
 _crawl_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_CRAWLS)
 _crawler = None  # lazily initialised
+_crawler_lock = asyncio.Lock()  # guards create/reset so racers can't double-start
+
+# Error text that means the shared browser itself is gone (crashed, OOM-killed),
+# not that one page failed. Without a reset, a cached dead browser fails every
+# fetch forever and the whole system silently deactivates.
+_BROWSER_DEAD_MARKERS = (
+    "browser has been closed",
+    "browser closed",
+    "target closed",
+    "connection closed",
+    "pipe closed",
+    "not connected",
+)
 
 
 async def _get_crawler():
     """Lazily initialise the AsyncWebCrawler (singleton)."""
     global _crawler
-    if _crawler is None:
-        from crawl4ai import AsyncWebCrawler, BrowserConfig
+    async with _crawler_lock:
+        if _crawler is None:
+            from crawl4ai import AsyncWebCrawler, BrowserConfig
 
-        browser_config = BrowserConfig(
-            headless=True,
-            verbose=False,
-            text_mode=True,          # disable images/media for speed + memory
-            light_mode=True,         # minimal browser setup
-            memory_saving_mode=True, # aggressive memory optimization
-            enable_stealth=True,     # patch the automation fingerprints bot-walls look for
-            user_agent_mode="random",  # rotate a realistic UA instead of HeadlessChrome
-        )
-        crawler = AsyncWebCrawler(config=browser_config)
-        try:
+            browser_config = BrowserConfig(
+                headless=True,
+                verbose=False,
+                text_mode=True,          # disable images/media for speed + memory
+                light_mode=True,         # minimal browser setup
+                memory_saving_mode=True, # aggressive memory optimization
+                enable_stealth=True,     # patch the automation fingerprints bot-walls look for
+                user_agent_mode="random",  # rotate a realistic UA instead of HeadlessChrome
+            )
+            crawler = AsyncWebCrawler(config=browser_config)
+            # Don't cache a half-initialised browser — a raise here leaves
+            # _crawler None so the next fetch retries from scratch.
             await crawler.start()
+            _crawler = crawler
+        return _crawler
+
+
+async def _reset_crawler():
+    """Drop the cached browser so the next fetch starts a fresh one."""
+    global _crawler
+    async with _crawler_lock:
+        crawler, _crawler = _crawler, None
+    if crawler is not None:
+        try:
+            await crawler.close()
         except Exception:
-            # Don't cache a half-initialised browser — otherwise every later
-            # fetch reuses the broken instance and silently returns 0 pages.
-            _crawler = None
-            raise
-        _crawler = crawler
-    return _crawler
+            pass  # it was likely already dead — that's why we're here
+    logger.warning("Crawler reset — a fresh browser will start on the next fetch")
 
 
 async def fetch_page(url: str) -> Optional[dict]:
@@ -117,6 +140,8 @@ async def fetch_page(url: str) -> Optional[dict]:
                 "error": None,
             }
         except Exception as e:
+            if any(m in str(e).lower() for m in _BROWSER_DEAD_MARKERS):
+                await _reset_crawler()
             logger.error("Exception crawling %s: %s", url, e)
             return {
                 "url": url,
@@ -248,8 +273,12 @@ def content_hash(text: str) -> str:
 
 
 async def shutdown_crawler():
-    """Clean shutdown of the browser."""
+    """Clean shutdown of the browser (called from the app's post_shutdown hook)."""
     global _crawler
-    if _crawler is not None:
-        await _crawler.close()
-        _crawler = None
+    async with _crawler_lock:
+        crawler, _crawler = _crawler, None
+    if crawler is not None:
+        try:
+            await crawler.close()
+        except Exception:
+            logger.exception("Crawler shutdown failed (browser may already be gone)")

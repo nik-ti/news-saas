@@ -12,6 +12,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("MVP_TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
+# The operator's Telegram user id — admin-only commands and system alerts go
+# here. Defaults to the alert chat so existing deployments need no new env var.
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", str(TELEGRAM_CHAT_ID)))
+
 # ── OpenRouter / LLM ──────────────────────────────────────────────────────────
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 LLM_MODEL_FAST = "deepseek/deepseek-v4-flash"            # speed tasks
@@ -25,7 +29,8 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "data", "news.db")
 # ── Research Engine ───────────────────────────────────────────────────────────
 MAX_SEARCH_QUERIES = 6           # how many varied queries to generate
 MAX_CANDIDATES_PER_QUERY = 8     # top results per Brave query
-MAX_CONCURRENT_CRAWLS = 15       # crawl4ai parallel semaphore (Stage 1 fetches all at once)
+MAX_CONCURRENT_CRAWLS = 8        # crawl4ai parallel semaphore — 15 concurrent pages
+                                 # in one Chromium was the likeliest OOM trigger
 MAX_CONCURRENT_SEARCHES = 3      # Brave Search parallel semaphore
 QUALIFICATION_SCORE_THRESHOLD = 70  # min score to accept a source
 DESIRED_SOURCES_MIN = 3
@@ -39,6 +44,13 @@ MAX_NEW_PER_SOURCE = 3           # new articles queued per source per cycle
 MAX_POSTS_PER_CYCLE = 10         # global cap on messages sent per cycle
 MAX_ARTICLE_ATTEMPTS = 3         # transient failures before an article is dropped
 HEALTH_CHECK_INTERVAL_HOURS = 24
+
+# Re-baseline guard: if a KNOWN source suddenly shows this many "new" items and
+# they make up at least this fraction of its page, the page structure changed
+# (redesign, URL scheme change) — re-baseline silently instead of posting stale
+# articles as news.
+REBASELINE_MIN_ITEMS = 8
+REBASELINE_FRACTION = 0.8
 
 # ── Text budgets ──────────────────────────────────────────────────────────────
 SUMMARY_CHAR_CAP = 1500          # summary handed to the gate and the post writer

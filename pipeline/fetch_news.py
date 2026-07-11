@@ -12,6 +12,8 @@ Three extraction strategies per source, in order:
      (changelogs, update-card pages), extract items from the page text itself.
 """
 import logging
+import re
+from urllib.parse import urlparse
 
 import httpx
 
@@ -109,6 +111,13 @@ async def _extract_inline_items(feed_url: str, page: dict) -> list[dict]:
     if len(content) < 200:  # nothing meaningful to extract
         return []
 
+    # Raw XML means we crawled a feed with the browser (transient RSS failure
+    # upstream). Asking an LLM to "extract news" from feed markup produces
+    # hallucinated items that would be posted to the user.
+    if content.lstrip()[:200].lower().startswith(("<?xml", "<rss", "<feed")):
+        logger.warning("Inline extraction skipped for %s — page is raw XML", feed_url)
+        return []
+
     result = await chat_json(
         SYSTEM_PROMPT_EXTRACT_ITEMS,
         f"Page URL: {feed_url}\n\nPage content:\n{content[:6000]}\n\n"
@@ -140,12 +149,36 @@ class SourceFetchError(Exception):
     """The source's feed page could not be read this cycle."""
 
 
+_ID_QUERY_RE = re.compile(r"(?:^|&)(?:p|id|post|article)=\d+")
+
+
+def _dedup_key(url: str) -> str:
+    """
+    Canonical form of an article URL for dedup hashing.
+
+    Tracking params are stripped, BUT on sites with query-string permalinks
+    (WordPress /?p=123 and friends) the query IS the article identity — blindly
+    dropping it collapses every post to the homepage, so the source only ever
+    delivers its first article.
+
+    For URLs without an identity query this is EXACTLY the legacy key
+    (scheme://host/path, no query, no trailing slash, lowercased) so existing
+    stored hashes stay valid across the upgrade.
+    """
+    base = url.split("?")[0].rstrip("/").lower()
+    p = urlparse(url)
+    query = (p.query or "").lower()
+    if query and (not p.path.strip("/") or _ID_QUERY_RE.search(query)):
+        return f"{base}?{query}"
+    return base
+
+
 def _item(title: str, url: str, summary: str = "", c_hash: str = "") -> dict:
     return {
         "title": title,
         "url": url,
         "summary": summary,
-        "content_hash": c_hash or content_hash(url.split("?")[0].rstrip("/").lower()),
+        "content_hash": c_hash or content_hash(_dedup_key(url)),
     }
 
 
@@ -171,6 +204,11 @@ async def snapshot_source(source: dict) -> list[dict]:
             items = [_item(i["title"], i["url"], i.get("summary", "")) for i in rss_items]
             logger.info("Source %s (RSS): %d items on page", url, len(items))
             return items
+        if method == "rss":
+            # This source is PROVEN to be a feed. An empty read is a fetch
+            # failure to be counted, not a reason to point a browser (and then
+            # an LLM) at raw XML and post whatever it hallucinates.
+            raise SourceFetchError("RSS feed returned no items")
 
     page = await fetch_page(feed_url)
     if not page["success"]:

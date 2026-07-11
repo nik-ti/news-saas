@@ -73,7 +73,22 @@ def init_db() -> None:
     CREATE INDEX IF NOT EXISTS idx_sources_stream ON sources(stream_id);
     CREATE INDEX IF NOT EXISTS idx_articles_source ON articles(source_id);
     CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status);
+    CREATE INDEX IF NOT EXISTS idx_articles_hash ON articles(content_hash);
     """)
+
+    # Dedup is enforced at the DB level so racing writers can't double-insert.
+    # A legacy DB may already hold per-source duplicates; fall back to the plain
+    # content_hash index above rather than failing startup.
+    try:
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_articles_src_hash "
+            "ON articles(source_id, content_hash)"
+        )
+    except sqlite3.IntegrityError:
+        logger.warning(
+            "Could not create UNIQUE(source_id, content_hash) index — existing "
+            "duplicate articles present; dedup stays best-effort in code"
+        )
 
     # Migrations for databases created before these columns existed
     # (must run AFTER table creation, or a fresh DB has no sources table to alter)
