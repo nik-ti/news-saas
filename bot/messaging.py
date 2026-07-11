@@ -21,11 +21,19 @@ TOKEN = config.TELEGRAM_BOT_TOKEN
 API_BASE = config.API_BASE
 
 # Telegram's HTML parse_mode accepts only these tags. Longest alternatives first
-# so "strike" isn't shadowed by "s", "strong" by "s", etc.
+# so "strike" isn't shadowed by "s", "strong" by "s", etc. Note: <br> and
+# <spoiler> are NOT valid Telegram HTML — one <br> from an LLM means a 400 and
+# a permanently dropped article. <br> is normalised to a newline instead; the
+# spoiler tag Telegram actually accepts is <tg-spoiler>.
 _ALLOWED_TAG_RE = re.compile(
-    r"</?(?:strike|spoiler|strong|code|pre|br|em|b|i|u|s|a)(?:\s[^<>]*)?/?>",
+    r"</?(?:tg-spoiler|blockquote|strike|strong|code|pre|del|ins|em|b|i|u|s|a)"
+    r"(?:\s[^<>]*)?>",
     re.IGNORECASE,
 )
+_BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+# Tags a truncation could leave dangling. Order matters: close inner-most last.
+_CLOSEABLE_TAGS = ("a", "code", "pre", "i", "b")
 
 
 def _escape_angles(text: str) -> str:
@@ -40,6 +48,7 @@ def sanitize_telegram_html(text: str) -> str:
     input' — including a lone "<" with no closing bracket. Recognized tags pass
     through untouched; everything else gets escaped.
     """
+    text = _BR_RE.sub("\n", text)
     out = []
     pos = 0
     for m in _ALLOWED_TAG_RE.finditer(text):
@@ -48,6 +57,29 @@ def sanitize_telegram_html(text: str) -> str:
         pos = m.end()
     out.append(_escape_angles(text[pos:]))
     return "".join(out)
+
+
+def _safe_truncate(html: str, limit: int = 4096) -> str:
+    """Truncate to Telegram's message limit without producing invalid HTML.
+
+    A blind slice can cut inside a tag or leave <b>/<a> unclosed — Telegram
+    rejects both, which permanently drops the article. Cut at a tag boundary
+    and close anything left dangling.
+    """
+    if len(html) <= limit:
+        return html
+    # Leave room for the closing tags we may need to append.
+    budget = limit - sum(len(f"</{t}>") for t in _CLOSEABLE_TAGS)
+    cut = html[:budget]
+    lt, gt = cut.rfind("<"), cut.rfind(">")
+    if lt > gt:                       # sliced mid-tag
+        cut = cut[:lt]
+    for tag in _CLOSEABLE_TAGS:
+        opens = len(re.findall(rf"<{tag}[\s>]", cut, re.IGNORECASE))
+        closes = len(re.findall(rf"</{tag}>", cut, re.IGNORECASE))
+        if opens > closes:
+            cut += f"</{tag}>"
+    return cut
 
 
 # ── Sync versions ─────────────────────────────────────────────────────────────
@@ -123,7 +155,7 @@ async def send_html_message_async(chat_id: int, html: str,
     """
     payload = {
         "chat_id": chat_id,
-        "text": sanitize_telegram_html(html)[:4096],
+        "text": _safe_truncate(sanitize_telegram_html(html)),
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }

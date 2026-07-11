@@ -3,6 +3,7 @@ Pipeline — Post Writer.
 Turns an article SUMMARY into a short, clean Telegram news post (Telegram HTML).
 Adapted from the re_news_channel post writer.
 """
+import html as html_mod
 import logging
 
 import config
@@ -129,7 +130,10 @@ async def write_post(summary_text: str, title: str = "", source_url: str = "",
         return ""
 
     if source_url:
-        post = f'{post}\n\n🔗 <a href="{source_url}">Source</a>'
+        # Crawled URLs can carry quotes/angle brackets; unescaped they break the
+        # anchor and Telegram rejects the whole message with a 400.
+        safe_url = html_mod.escape(source_url, quote=True)
+        post = f'{post}\n\n🔗 <a href="{safe_url}">Source</a>'
     return post
 
 
