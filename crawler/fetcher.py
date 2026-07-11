@@ -112,7 +112,7 @@ async def fetch_page(url: str) -> Optional[dict]:
                 "title": title,
                 "content": content_text[:8000],  # cap to avoid huge payloads
                 "html": raw_html,
-                "links": links[:100],  # cap links
+                "links": links[:300],  # cap links
                 "success": True,
                 "error": None,
             }

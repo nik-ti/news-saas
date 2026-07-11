@@ -39,14 +39,24 @@ def news_query_for(profile: dict) -> str:
     """
     The single best Google News query for a stream's profile.
 
-    Prefer the sharpest specific topic; fall back to the domain. Google News
-    search is plain keywords, so we keep it short and concrete.
+    Google News search is plain keywords, so we keep it short and concrete.
+    Always anchor on the broad domain so "market-moving news" (a topic
+    description) doesn't become a standalone query that returns cattle futures.
     """
+    domain = (profile.get("broad_domain") or "").strip()
     topics = profile.get("specific_topics") or []
-    if topics:
-        return str(topics[0])
-    for key in ("broad_domain", "description", "topic"):
+    keywords = profile.get("keywords") or []
+
+    # Domain + first topic is specific without being too long
+    if domain and topics:
+        return f"{domain} {topics[0]}"
+    if domain:
+        return domain
+    # keywords are often already search-ready ("crypto market news")
+    if keywords:
+        return keywords[0]
+    for key in ("description", "topic"):
         val = profile.get(key)
         if val:
-            return str(val)
+            return str(val)[:80]
     return "top news"

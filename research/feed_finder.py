@@ -321,26 +321,32 @@ async def find_news_pages(site_url: str, max_candidates: int = 5) -> list[Candid
 
     # ── 1. Ask the site for its feed, over plain HTTP (fast path) ────────
     #
-    # If the root refuses a plain client (403 behind a WAF), do NOT go on to
-    # probe six more paths. Every probe is another refusal, and a burst of them
-    # trips the bot challenge — after which even the crawler gets locked out.
-    # Measured on openai.com: homepage crawls fine, six 403s, homepage blocked.
+    # If the root is behind a WAF, do NOT re-probe it with more requests —
+    # a burst trips the bot challenge and locks the crawler out afterwards.
+    # BUT: common feed paths (/rss.xml, /feed) often have different access
+    # rules than the root. telegraph.co.uk returns 402 on its root but serves
+    # 120 items on /rss.xml via plain httpx. So:
+    #   * Root 200 → autodiscover from its HTML + probe feed paths
+    #   * Root non-200 → skip HTML autodiscovery, but STILL probe feed paths
+    #     (they may respond even when the root doesn't)
     status, html = await _get(root)
     http_usable = status == 200
 
     tried: list[str] = []
+    # Always probe common feed paths — they can be accessible even when root isn't
+    feed_path_urls = [urljoin(root, p) for p in COMMON_FEED_PATHS]
     if http_usable:
-        tried = _dedupe(
-            await _autodiscover_feeds(root, html)
-            + [urljoin(root, p) for p in COMMON_FEED_PATHS]
-        )
-        feeds = await _verify_feeds(tried)
-        if feeds:
-            logger.info("feed_finder: %d verified feed(s) via HTTP — done", len(feeds))
-            return feeds[:max_candidates]
+        autodiscovered = await _autodiscover_feeds(root, html)
+        tried = _dedupe(autodiscovered + feed_path_urls)
     else:
-        logger.info("feed_finder: %s rejects plain HTTP (%s) — crawler only",
-                    root, status or "no response")
+        logger.info("feed_finder: %s root returned %s — skipping HTML autodiscovery, "
+                    "probing feed paths directly", root, status or "no response")
+        tried = _dedupe(feed_path_urls)
+
+    feeds = await _verify_feeds(tried)
+    if feeds:
+        logger.info("feed_finder: %d verified feed(s) via HTTP — done", len(feeds))
+        return feeds[:max_candidates]
 
     # ── 2. Crawl the homepage. We need its links for structure anyway, and
     #      its HTML lets us autodiscover on hosts that 403 a plain client. ──
