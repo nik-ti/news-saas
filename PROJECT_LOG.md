@@ -41,25 +41,41 @@ Self-serve news service: user describes a topic → AI research engine finds the
 - Caps: 3 new articles per source per cycle, 10 posts per cycle globally
 - 3-strategy article extraction: RSS feeds → link extraction → LLM inline extraction
 - Transient failures (LLM outage, network) retry up to 3 times; permanent ones (Telegram 400/403) are terminal
+- Computed summaries are persisted, so a retry costs one LLM call, not a re-crawl
 - Overlap guard: a slow cycle causes the next tick to skip
-- Health check: re-tests **errored** sources every 24 hours (never revives `blocked` ones)
+- Circuit breaker: if most sources fail in one cycle (dead browser, outage), nobody's
+  strike counter is charged and the crawler is reset
+- Flood guard: a known source whose page is suddenly ~all-new (redesign) is silently
+  re-baselined instead of spamming stale articles
+- Health check: re-tests **errored and blocked** sources every 24 hours, RSS-aware
 
 ### Telegram Bot
 - `/newstream` — natural interview → AI research → sources found
 - `/streams`, `/sources`, `/sources_all` — view streams and sources
 - `/addsource` — discovers the site's news page(s); asks if there are several
 - `/deletesource`, `/testsource` — manual source management (ownership-checked)
-- `/research` — re-run research for a stream, regenerating profile + rubric
-- `/latest` — show latest articles
+- `/research` — re-run research for a stream, regenerating profile + rubric (ownership-checked)
+- `/latest` — show the caller's latest articles (tenant-scoped)
 - `/runpipeline` — manually run the same news cycle the cron runs
 - `/status` — system stats, including sources awaiting baseline
+- Authorization: `/sources_all`, `/runpipeline`, `/status`, `/testsource` are
+  admin-only (`ADMIN_USER_ID`); every stream-taking command checks ownership
 - Inline keyboards wired through a `CallbackQueryHandler`
 - `sendRichMessage` for bot chrome; plain `sendMessage` + sanitized Telegram HTML for news posts
 
 ### Database
 - SQLite: streams, sources (feed_url, fail_count, baselined_at), articles (status, attempts, posted_at)
-- Article states: `seen` | `new` | `posted` | `irrelevant` — every article ends terminal
+- Article states: `new` | `seen` (baseline) | `posted` | `irrelevant` | `unusable` |
+  `dropped` | `send_failed` — every article ends terminal, and the status says *why*
+- Dedup is **per stream** (overlapping streams each receive an article) and enforced
+  at the DB level: `UNIQUE(source_id, content_hash)` + a `content_hash` index
 - Auto-migrations for schema changes (sources and articles)
+
+### Tests
+- 74 offline tests in `tests/` (`python3 -m pytest tests/ -q`, ~7 s)
+- No network, no browser: temp SQLite per test, external calls stubbed
+- Regression-proven: the suite was run against the pre-fix code and failed on
+  exactly the bugs it targets (17 behavioral failures), then passed on the fixes
 
 ---
 
@@ -148,6 +164,57 @@ speculative feed probing no longer trips Cloudflare and locks the crawler out.
 - **Research reporting** no longer says "found nothing" when sources were stored
   but temporarily unreachable; validation retries rate-limited hosts.
 
+### Jul 11, 2026 — Full audit + hardening (phases 1–2)
+
+A single-pass technical audit of the whole codebase, then two implementation phases on
+branch `claude/news-saas-audit-ib1yqa` (5 + 3 commits, plus docs). Everything verified
+by a new 74-test offline suite, including a regression proof against the pre-fix code.
+
+**Phase 1 — all 14 critical issues + a startup self-check:**
+- **Per-stream article dedup.** Dedup was global, so an article shared by two streams
+  was delivered to only one — a hard multi-tenant blocker. Now scoped per stream, with
+  `UNIQUE(source_id, content_hash)` + a hash index at the DB level.
+- **Crawler lifecycle.** A crashed headless browser stayed cached forever: every fetch
+  failed, every source got blamed, and the whole system mass-deactivated within ~90 min
+  (the health check used the same dead browser, so nothing recovered). Now: dead-browser
+  detection + reset, a >50%-failures circuit breaker, a shutdown hook, crawl
+  concurrency 15 → 8.
+- **Command authorization.** Any Telegram user could read every tenant's data and
+  trigger paid research runs. Added `ADMIN_USER_ID` gate + ownership checks + scoped `/latest`.
+- **Telegram HTML safety.** `<br>`/bad truncation/unescaped URLs caused 400s that
+  permanently dropped articles. Valid tag whitelist, tag-safe truncation, escaped links.
+- **Silent failures made loud.** Total Brave Search failure (dead key) was
+  indistinguishable from "no results"; proven-RSS feeds falling back to browser+LLM
+  produced hallucinated posts from raw XML; LLM `null` fields crashed whole research
+  runs. All fixed; plus a 🩺 startup self-check that pings both LLMs, embeddings, and
+  Brave at boot and messages the admin about anything dead.
+- Also: feed repair now runs *before* validation (good sources were being wrongly
+  discarded), flood/re-baseline guard, WordPress `?p=` permalink hashing, Google News
+  dup guard on re-research, intake conversation preserved for `/research`, RSS-aware
+  health check, `feed:force` dup guard.
+
+**Phase 2 — code quality (audit §2, minus the summarize+gate merge):**
+- **Real summaries for RSS items.** RSS teaser descriptions no longer masquerade as
+  summaries — thin ones trigger a real article fetch; teasers remain a graceful
+  fallback for paywalls/fetch failures. Computed summaries are persisted (cheap retries).
+- **Distinct terminal statuses** (`dropped`/`unusable`/`send_failed`) replace the
+  four-way overload of `seen`.
+- **Refactors:** store.py around one `db()` context manager (~25 copies of
+  connect/commit/close removed), one shared Telegram transport (`_api` + reused
+  AsyncClient), one model-keyed LLM client (`chat(..., model="fast"|"smart"|"post")`),
+  Stage-1 prefilter chunks parallelized.
+- **Pruning:** dead `bot/keyboards.py`, dead store functions, unused deps
+  (`langgraph`, `langchain-community`, `rank-bm25`, `langchain` meta); `numpy` added
+  (was imported but never declared).
+
+**Docs:** `SUGGESTIONS.md` added — the full remaining roadmap (schema split to shared
+sources, worker split, semantic story dedup, usage limits, Firecrawl ladder, quiet
+hours, feedback loop, CI) written so any future session can execute it.
+
+**Operator notes:** set `ADMIN_USER_ID` in `.env` if the alert chat isn't your personal
+account; pin `crawl4ai` to the server's deployed version; watch the 🩺 self-check
+message on first boot (it will reveal whether the embeddings endpoint actually works).
+
 ---
 
 ## Tech Stack
@@ -186,3 +253,9 @@ python main.py
 
 The webhook is registered automatically on boot to `$WEBHOOK_HOST$WEBHOOK_PATH`
 (default `https://bot.simple-flow.co/test-news-saas`), served by nginx on `127.0.0.1:3010`.
+
+Run the test suite (offline — no keys, no browser needed):
+
+```bash
+python3 -m pytest tests/ -q
+```
