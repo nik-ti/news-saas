@@ -62,7 +62,8 @@ def init_db() -> None:
         url             TEXT,
         summary         TEXT,
         relevance_score REAL    DEFAULT 0,
-        status          TEXT    DEFAULT 'new',   -- seen | new | posted | irrelevant
+        status          TEXT    DEFAULT 'new',   -- new | seen (baselined) | posted |
+                                                 -- irrelevant | unusable | dropped | send_failed
         fetched_at      TEXT    DEFAULT (datetime('now')),
         delivered_at    TEXT,
         posted_at       TEXT,

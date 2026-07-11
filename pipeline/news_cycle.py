@@ -187,7 +187,7 @@ def _retry_or_drop(article_id: int, why: str) -> str:
     if attempts >= config.MAX_ARTICLE_ATTEMPTS:
         logger.warning("Article %d dropped after %d attempts (%s)",
                        article_id, attempts, why)
-        store.update_article_status(article_id, "seen")
+        store.update_article_status(article_id, "dropped")
         return "dropped"
     logger.info("Article %d left queued for retry %d/%d (%s)",
                 article_id, attempts, config.MAX_ARTICLE_ATTEMPTS, why)
@@ -219,9 +219,14 @@ async def _post_phase() -> dict:
             summary, title = await summarize_article(article)
             if summary == SKIP:
                 logger.info("Article %d not a usable news page — dropped", article_id)
-                store.update_article_status(article_id, "seen")
+                store.update_article_status(article_id, "unusable")
                 stats["dropped"] += 1
                 continue
+
+            # Persist the summary: a retry (LLM outage, Telegram 5xx) then costs
+            # one LLM call instead of a crawl + summarize per attempt.
+            if summary != (article.get("summary") or "").strip():
+                store.set_article_summary(article_id, summary)
 
             is_relevant, reason = await check_relevance(title, summary, profile)
             if not is_relevant:
@@ -248,7 +253,7 @@ async def _post_phase() -> dict:
             elif _is_terminal_send_error(result):
                 logger.error("Permanent send failure for article %d: %s",
                              article_id, result.get("description"))
-                store.update_article_status(article_id, "seen")
+                store.update_article_status(article_id, "send_failed")
                 stats["dropped"] += 1
             else:
                 stats[_retry_or_drop(article_id, "send failed")] += 1

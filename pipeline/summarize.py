@@ -53,15 +53,23 @@ async def summarize_article(article: dict) -> tuple[str, str]:
     if is_google_news_url(url):
         return (title or SKIP), title
 
-    # Inline-extracted items (changelog-style sources) already carry a summary,
-    # and their url points at the feed page, so re-fetching would be wrong.
+    # A stored summary is only trusted as-is when it can't be improved on:
+    #  * inline-extracted items (changelog-style) — their url IS the feed page,
+    #    so re-fetching would be wrong; or
+    #  * it's already substantial (a previously computed summary on a retry).
+    # Anything shorter is an RSS <description> teaser ("Read more…") — the gate
+    # and the post writer deserve the actual article.
     existing = (article.get("summary") or "").strip()
-    if existing:
+    is_inline = bool(url) and url == (article.get("source_feed_url") or "")
+    if existing and (is_inline or len(existing) >= config.MIN_TRUSTED_SUMMARY_CHARS):
         return existing[:config.SUMMARY_CHAR_CAP], title
 
     page = await fetch_page(url)
     if not page["success"] or not page["content"]:
         logger.info("Can't fetch article %s: %s", url, page.get("error", "no content"))
+        if existing:
+            # The teaser is thin but real — better than losing the article.
+            return existing[:config.SUMMARY_CHAR_CAP], title
         return SKIP, title
 
     if page["title"] and len(title) > 80:
@@ -73,6 +81,10 @@ async def summarize_article(article: dict) -> tuple[str, str]:
     )
     summary = (result.get("summary") or "").strip()
 
-    if not summary:
+    if not summary or summary == SKIP:
+        # Paywall/nav page behind the link — the RSS teaser, if we have one,
+        # is still a real blurb worth gating and posting.
+        if existing:
+            return existing[:config.SUMMARY_CHAR_CAP], title
         return SKIP, title
     return summary[:config.SUMMARY_CHAR_CAP], title

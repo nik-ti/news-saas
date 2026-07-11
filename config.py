@@ -54,6 +54,8 @@ REBASELINE_FRACTION = 0.8
 
 # ── Text budgets ──────────────────────────────────────────────────────────────
 SUMMARY_CHAR_CAP = 1500          # summary handed to the gate and the post writer
+MIN_TRUSTED_SUMMARY_CHARS = 300  # a stored summary shorter than this is an RSS
+                                 # teaser — fetch the real article instead
 POST_INPUT_CHAR_CAP = 2000       # cap on what the post writer reads
 
 # ── Telegram API base (for sendRichMessage) ──────────────────────────────────
