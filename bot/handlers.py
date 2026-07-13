@@ -36,6 +36,10 @@ INTERVIEW = 0
 
 # ── Authorization ──────────────────────────────────────────────────────────────
 
+def _is_admin(user_id: int) -> bool:
+    return user_id == config.ADMIN_USER_ID
+
+
 def admin_only(handler):
     """Restrict a command to the operator (config.ADMIN_USER_ID).
 
@@ -45,7 +49,7 @@ def admin_only(handler):
     @functools.wraps(handler)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        if user is None or user.id != config.ADMIN_USER_ID:
+        if user is None or not _is_admin(user.id):
             await send_rich_async(update.effective_chat.id,
                                   "❌ This command is restricted to the operator.")
             return
@@ -57,40 +61,57 @@ def admin_only(handler):
 # COMMAND: /start
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Welcome message with rich command table."""
-    await send_rich_async(update.effective_chat.id, """\
+_START_USER = """\
 # 🗞️ NewsStream Bot
 
-*Your autonomous news research engine.*
+*Your personal news researcher.*
 
-Tell me what you want, and I'll find the best sources, monitor them, and \
-deliver relevant news directly to you.
+Tell me what you want to stay on top of — in your own words — and I'll find \
+the best sources for it, watch them around the clock, and send you only the \
+stories that match.
 
-## Commands
+**Start with** `/newstream` — just describe your topic.
+
+## Your commands
 
 | Command | Description |
 |---------|-------------|
-| `/newstream` | Set up a new news stream (just tell me what you want) |
-| `/streams` | List all your news streams |
-| `/sources <stream_id>` | View sources for a stream |
-| `/sources_all` | View the entire source database |
-| `/addsource <stream_id> <url>` | Manually add a source |
+| `/newstream` | Set up a news stream (just tell me what you want) |
+| `/streams` | List your streams |
+| `/sources <stream_id>` | See what a stream is watching |
+| `/addsource <stream_id> <url>` | Add a site you already like |
 | `/deletesource <source_id>` | Remove a source from your stream |
-| `/testsource <url>` | Test if a URL is fetchable |
-| `/research <stream_id>` | Re-run research for a stream |
-| `/latest` | Show latest fetched articles |
-| `/runpipeline` | Run fetch → summarize → deliver now |
-| `/postsize <stream_id>` | Choose post length (standard / compact) |
-| `/pausestream <stream_id>` | Pause a stream (no posts, no crawling) |
+| `/research <stream_id>` | Re-run source research for a stream |
+| `/latest` | Your latest fetched articles |
+| `/postsize <stream_id>` | Post length: standard / compact |
+| `/pausestream <stream_id>` | Pause a stream |
 | `/resumestream <stream_id>` | Resume a paused stream |
-| `/deletestream <stream_id>` | Delete a stream and its sources |
-| `/quiet <stream_id> 23-8` | No posts between those hours (`off` to clear) |
-| `/status` | Show system status |
+| `/deletestream <stream_id>` | Delete a stream |
+| `/quiet <stream_id> 23-8` | No posts between those hours (`off` to clear) |\
+"""
 
----
-*Powered by autonomous AI research.*\
-""")
+_START_ADMIN_EXTRA = """
+
+
+## Operator commands (only you see these)
+
+| Command | Description |
+|---------|-------------|
+| `/status` | System stats across all users |
+| `/sources_all` | The entire source database |
+| `/runpipeline` | Run the news cycle now |
+| `/testsource <url>` | Test if a URL is fetchable |
+
+You also bypass the per-user limits and can manage any user's stream by id.\
+"""
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Welcome message; admins additionally see the operator commands."""
+    text = _START_USER
+    if _is_admin(update.effective_user.id):
+        text += _START_ADMIN_EXTRA
+    await send_rich_async(update.effective_chat.id, text)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -127,8 +148,25 @@ async def handle_interview(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return await _start_research(update, context)
 
 
+async def _notify_admin_new_user(user, stream_name: str) -> None:
+    """Best-effort heads-up to the operator — must never break stream creation."""
+    try:
+        handle = f"@{user.username}" if getattr(user, "username", None) else "no username"
+        await send_rich_async(
+            config.ADMIN_USER_ID,
+            f"👋 **New user:** {getattr(user, 'full_name', '') or 'unknown'} "
+            f"({handle}, id `{user.id}`) just created their first stream: "
+            f"_{stream_name}_",
+        )
+    except Exception:
+        logger.exception("New-user notification failed (non-fatal)")
+
+
 def _research_allowed(user_id: int) -> tuple[bool, str]:
-    """Per-user limits (§3.3): research is a ~100-crawl, ~40-LLM-call operation."""
+    """Per-user limits (§3.3): research is a ~100-crawl, ~40-LLM-call operation.
+    The admin runs the system and pays its bills — limits don't apply to them."""
+    if _is_admin(user_id):
+        return True, ""
     if store.get_usage(user_id, "research_run") >= config.RESEARCH_RUNS_PER_DAY:
         return False, (f"You've used your {config.RESEARCH_RUNS_PER_DAY} research "
                        f"runs for today — try again tomorrow.")
@@ -138,7 +176,8 @@ def _research_allowed(user_id: int) -> tuple[bool, str]:
 async def _start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Compile the conversation and kick off research."""
     user_id = update.effective_user.id
-    if store.count_streams(user_id) >= config.MAX_STREAMS_PER_USER:
+    if not _is_admin(user_id) and \
+            store.count_streams(user_id) >= config.MAX_STREAMS_PER_USER:
         await send_rich_async(
             update.effective_chat.id,
             f"You already have {config.MAX_STREAMS_PER_USER} streams — that's the "
@@ -162,6 +201,8 @@ async def _start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     answers = {"topic": first_answer, "conversation": convo_text}
 
+    is_first_stream = store.count_streams(user_id) == 0
+
     stream_name = first_answer[:50]
     stream_id = store.create_stream(
         user_id=user_id,
@@ -170,6 +211,11 @@ async def _start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     store.update_stream_status(stream_id, "researching")
     context.user_data["stream_id"] = stream_id
+
+    # The bot is open to anyone on Telegram — tell the operator when a NEW
+    # person actually starts using it (first stream, not every stream).
+    if is_first_stream and not _is_admin(user_id):
+        await _notify_admin_new_user(update.effective_user, stream_name)
 
     chat_id = update.effective_chat.id
     await context.bot.send_message(
@@ -585,10 +631,12 @@ async def cmd_sources_all(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _owns_stream(user_id: int, stream_id: int) -> tuple[bool, dict | None]:
+    """Ownership check. The admin passes for EVERY stream — they operate the
+    system (and auto-pause tells them to /resumestream streams they don't own)."""
     stream = store.get_stream(stream_id)
     if not stream:
         return False, None
-    return stream["user_id"] == user_id, stream
+    return _is_admin(user_id) or stream["user_id"] == user_id, stream
 
 
 async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -616,7 +664,8 @@ async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await send_rich_async(chat_id, "❌ That stream isn't yours.")
         return
 
-    if len(store.get_sources_by_stream(stream_id)) >= config.MAX_SOURCES_PER_STREAM:
+    if not _is_admin(update.effective_user.id) and \
+            len(store.get_sources_by_stream(stream_id)) >= config.MAX_SOURCES_PER_STREAM:
         await send_rich_async(
             chat_id,
             f"This stream already follows {config.MAX_SOURCES_PER_STREAM} sources "
