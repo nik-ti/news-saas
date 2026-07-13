@@ -15,6 +15,23 @@ async def test_source_url_is_escaped(monkeypatch):
     assert f'href="{hostile}"' not in post
 
 
+async def test_system_prompt_has_plain_language_rules(monkeypatch):
+    """The plain-language section must reach the model with placeholders
+    resolved, and must keep its accuracy guard (simplify wording, not meaning)."""
+    captured = {}
+
+    async def spy_llm(system, user, model="post"):
+        captured["system"] = system
+        return "<b>Headline</b>\n\nBody."
+    monkeypatch.setattr(pw, "chat", spy_llm)
+
+    await pw.write_post("summary", title="T", length="compact")
+    system = captured["system"]
+    assert "## Plain Language" in system
+    assert "NEVER overrides Factual Accuracy" in system
+    assert "{length_rule}" not in system and "{language_rule}" not in system
+
+
 async def test_clean_url_passes_through(monkeypatch):
     async def fake_llm(system, user, model="post"):
         return "<b>Headline</b>\n\nBody."

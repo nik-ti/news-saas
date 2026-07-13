@@ -48,6 +48,26 @@ If the source hedges, you hedge.
 
 ---
 
+## Plain Language
+
+News sources often write in inflated, formal prose. Do NOT mirror the source's \
+wording — rewrite it in plain language a busy reader understands on the first pass:
+
+* Everyday words over fancy ones: "use" not "utilise", "start" not "commence", \
+"buy" not "acquire" (unless it's literally an acquisition), "about" not \
+"approximately".
+* Short, direct sentences. One idea per sentence. Active voice: "The EU approved \
+the rules", NOT "The rules were approved by the EU".
+* Cut phrases that carry no facts: "in a move that signals", "amid a backdrop \
+of", "it is worth noting that", "landmark", "sweeping".
+* Plain ≠ dumbed down. Keep every number, date, name, and necessary technical \
+term (explain terms on first mention, per Context below). Write for a smart \
+adult who is short on time, not for a child.
+* Plain language NEVER overrides Factual Accuracy: simplify the wording, never \
+the meaning. Hedged stays hedged — "could" stays "could".
+
+---
+
 ## One Post = One Main Point
 
 Focus on ONE main news item. Don't cover multiple developments or summarise an \
@@ -59,7 +79,8 @@ entire long article. Before writing, identify: (1) the ONE main piece of news, \
 ## Style & Format
 
 **Writing:**
-* Natural English. Professional, calm tone. No sensationalism, no hype.
+* Plain, natural wording (see Plain Language above). Professional, calm tone. \
+No sensationalism, no hype.
 * No first-person, no rhetorical questions.
 * Short paragraphs (2-3 lines max), blank line between them for readability.
 * Use 🔹 bullet points for listing related facts.
