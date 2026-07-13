@@ -1,9 +1,10 @@
 python-telegram-bot[webhooks]==21.10
 httpx>=0.27.0
 telegramify-markdown>=1.2.0
-# Pin crawl4ai to your deployed version (pip freeze | grep crawl4ai) —
-# the BrowserConfig kwargs in crawler/fetcher.py are version-sensitive.
-crawl4ai>=0.4.0
+# Pinned to the deployed version (§4.1) — the BrowserConfig kwargs in
+# crawler/fetcher.py are version-sensitive; an unpinned redeploy can pull a
+# release that renames them and crash at startup.
+Crawl4AI==0.9.1
 langchain-openai>=0.2.0
 langchain-core>=0.3.0
 APScheduler>=3.10.0

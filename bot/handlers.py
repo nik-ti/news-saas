@@ -24,6 +24,7 @@ from research.engine import run_research
 from research.feed_finder import find_news_pages
 from research.profile_builder import interview_turn, OPENER
 from crawler.fetcher import test_source
+from pipeline import usage
 from pipeline.news_cycle import run_news_cycle
 
 logger = logging.getLogger(__name__)
@@ -75,12 +76,16 @@ deliver relevant news directly to you.
 | `/sources <stream_id>` | View sources for a stream |
 | `/sources_all` | View the entire source database |
 | `/addsource <stream_id> <url>` | Manually add a source |
-| `/deletesource <source_id>` | Delete a source |
+| `/deletesource <source_id>` | Remove a source from your stream |
 | `/testsource <url>` | Test if a URL is fetchable |
 | `/research <stream_id>` | Re-run research for a stream |
 | `/latest` | Show latest fetched articles |
 | `/runpipeline` | Run fetch → summarize → deliver now |
 | `/postsize <stream_id>` | Choose post length (standard / compact) |
+| `/pausestream <stream_id>` | Pause a stream (no posts, no crawling) |
+| `/resumestream <stream_id>` | Resume a paused stream |
+| `/deletestream <stream_id>` | Delete a stream and its sources |
+| `/quiet <stream_id> 23-8` | No posts between those hours (`off` to clear) |
 | `/status` | Show system status |
 
 ---
@@ -122,8 +127,28 @@ async def handle_interview(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return await _start_research(update, context)
 
 
+def _research_allowed(user_id: int) -> tuple[bool, str]:
+    """Per-user limits (§3.3): research is a ~100-crawl, ~40-LLM-call operation."""
+    if store.get_usage(user_id, "research_run") >= config.RESEARCH_RUNS_PER_DAY:
+        return False, (f"You've used your {config.RESEARCH_RUNS_PER_DAY} research "
+                       f"runs for today — try again tomorrow.")
+    return True, ""
+
+
 async def _start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Compile the conversation and kick off research."""
+    user_id = update.effective_user.id
+    if store.count_streams(user_id) >= config.MAX_STREAMS_PER_USER:
+        await send_rich_async(
+            update.effective_chat.id,
+            f"You already have {config.MAX_STREAMS_PER_USER} streams — that's the "
+            f"limit for now. `/deletestream <id>` frees a slot.")
+        return ConversationHandler.END
+    allowed, why = _research_allowed(user_id)
+    if not allowed:
+        await send_rich_async(update.effective_chat.id, why)
+        return ConversationHandler.END
+
     transcript = context.user_data.get("transcript", [])
 
     # Seed the stream name from the user's first answer; hand the full
@@ -139,7 +164,7 @@ async def _start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     stream_name = first_answer[:50]
     stream_id = store.create_stream(
-        user_id=update.effective_user.id,
+        user_id=user_id,
         name=stream_name,
         criteria=answers,  # temporary, replaced with the profile after research
     )
@@ -155,7 +180,8 @@ async def _start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_markup=_post_length_keyboard(stream_id),
     )
 
-    asyncio.create_task(_run_research_background(stream_id, answers, chat_id, context))
+    asyncio.create_task(_run_research_background(stream_id, answers, chat_id,
+                                                 context, user_id=user_id))
 
     return ConversationHandler.END
 
@@ -194,9 +220,112 @@ async def cmd_postsize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stream lifecycle: /pausestream, /resumestream, /deletestream, /quiet  (§3.1, §3.6)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _owned_stream_from_args(update, context) -> tuple[int | None, dict | None]:
+    """Parse `<stream_id>` from args and verify ownership. Replies on failure."""
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await send_rich_async(chat_id, "Usage: give me a stream id — "
+                                       "`/streams` lists yours.")
+        return None, None
+    try:
+        stream_id = int(context.args[0])
+    except ValueError:
+        await send_rich_async(chat_id, "Invalid stream ID.")
+        return None, None
+    owns, stream = await _owns_stream(update.effective_user.id, stream_id)
+    if stream is None or not owns:
+        await send_rich_async(chat_id, "❌ That stream isn't yours.")
+        return None, None
+    return stream_id, stream
+
+
+async def cmd_pausestream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pause a stream: no posts AND no crawling for sources only it follows."""
+    stream_id, stream = await _owned_stream_from_args(update, context)
+    if stream_id is None:
+        return
+    store.update_stream_status(stream_id, "paused")
+    await send_rich_async(
+        update.effective_chat.id,
+        f"⏸️ **{stream['name']}** is paused — nothing will be posted and its "
+        f"sources stop being crawled. `/resumestream {stream_id}` brings it back.")
+
+
+async def cmd_resumestream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Resume a paused stream."""
+    stream_id, stream = await _owned_stream_from_args(update, context)
+    if stream_id is None:
+        return
+    store.update_stream_status(stream_id, "active")
+    store.record_send_result(stream_id, ok=True)  # clear the auto-pause streak
+    await send_rich_async(
+        update.effective_chat.id,
+        f"▶️ **{stream['name']}** is active again. Sources resume on the next cycle.")
+
+
+async def cmd_deletestream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete a stream — destructive, so it asks for one confirmation tap."""
+    stream_id, stream = await _owned_stream_from_args(update, context)
+    if stream_id is None:
+        return
+    n_sources = len(store.get_sources_by_stream(stream_id))
+    await context.bot.send_message(
+        update.effective_chat.id,
+        f"Delete \"{stream['name']}\" and its {n_sources} source "
+        f"subscription(s)? This can't be undone.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑 Yes, delete it",
+                                 callback_data=f"del_stream:{stream_id}"),
+            InlineKeyboardButton("✖️ Keep it", callback_data="del_stream:cancel"),
+        ]]),
+    )
+
+
+async def cmd_quiet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set a stream's quiet hours: posts inside the window are held, not lost."""
+    chat_id = update.effective_chat.id
+    if len(context.args) < 2:
+        await send_rich_async(
+            chat_id,
+            "Usage: `/quiet <stream_id> 23-8` — no posts from 23:00 to 08:00 "
+            "(server time). `/quiet <stream_id> off` clears it.")
+        return
+    stream_id, stream = await _owned_stream_from_args(update, context)
+    if stream_id is None:
+        return
+
+    spec = context.args[1].strip().lower()
+    if spec in ("off", "none", "clear"):
+        store.set_stream_criteria_field(stream_id, "quiet_hours", "")
+        await send_rich_async(chat_id, f"🔔 Quiet hours cleared for "
+                                       f"**{stream['name']}** — posts flow 24/7.")
+        return
+
+    from pipeline.news_cycle import _parse_quiet_hours
+    if _parse_quiet_hours({"quiet_hours": spec}) is None:
+        await send_rich_async(chat_id, "That doesn't parse — use e.g. `23-8` "
+                                       "(hours 0–23, start ≠ end).")
+        return
+    store.set_stream_criteria_field(stream_id, "quiet_hours", spec)
+    start, end = spec.split("-", 1)
+    await send_rich_async(
+        chat_id,
+        f"🔕 Quiet hours set for **{stream['name']}**: nothing between "
+        f"{int(start):02d}:00 and {int(end):02d}:00 (server time). Held posts "
+        f"go out on the first cycle after the window ends.")
+
+
 async def _run_research_background(stream_id: int, answers: dict, chat_id: int,
-                                     context: ContextTypes.DEFAULT_TYPE):
+                                     context: ContextTypes.DEFAULT_TYPE,
+                                     user_id: int = 0):
     """Run research in background, send progress updates."""
+    # Attribute every crawl/LLM call in this task to the requesting tenant.
+    usage.set_user(user_id)
+    store.increment_usage(user_id, "research_run")
     try:
         state = await run_research(answers, stream_id, progress=None)
 
@@ -225,23 +354,49 @@ async def _run_research_background(stream_id: int, answers: dict, chat_id: int,
         active = [s for s in stored if s["fetch_status"] == "active"]
         blocked = [s for s in stored if s["fetch_status"] == "blocked"]
 
+        # §2.4 reconciliation: "research succeeded" must mean the sources
+        # actually YIELD articles, not just that their pages loaded once.
+        # Snapshot each stored active source and report honestly.
+        item_counts = await _reconcile_sources(active)
+
         if active or blocked:
+            live = [s for s in active if item_counts.get(s["id"], 0) > 0]
+            pending = [s for s in active if item_counts.get(s["id"], 0) == 0]
+
             lines = [f"# ✅ Found {len(stored)} sources for you", "",
                      f"Here's what I'll be watching for **{stream_name}**:", "",
-                     "| # | Source | Match | Status |",
-                     "|---|--------|-------|--------|"]
+                     "| # | Source | Match | Articles | Status |",
+                     "|---|--------|-------|----------|--------|"]
             for i, src in enumerate(active + blocked, 1):
                 name = (src.get("name") or src["url"])[:25]
                 score = src.get("quality_score", 0)
-                icon = "✅" if src["fetch_status"] == "active" else "🔄"
-                lines.append(f"| {i} | {name} | {score}/100 | {icon} |")
+                if src["fetch_status"] != "active":
+                    icon, n_items = "🔄", "—"
+                else:
+                    n = item_counts.get(src["id"], 0)
+                    icon = "✅" if n else "⏳"
+                    n_items = str(n) if n else "0"
+                lines.append(f"| {i} | {name} | {score}/100 | {n_items} | {icon} |")
 
-            if active:
-                lines.append("\nI'll start pulling relevant stories from these shortly.")
+            if live:
+                lines.append(f"\n{len(live)} source(s) are live and already "
+                             f"listing articles — I'll start pulling relevant "
+                             f"stories shortly.")
+            if pending:
+                lines.append(
+                    f"\n⏳ {len(pending)} listed no articles on the first read — "
+                    f"they stay on watch and count as live the moment they yield."
+                )
             if blocked:
                 lines.append(
                     f"\n🔄 {len(blocked)} were busy when I checked — I'll keep "
                     f"retrying them automatically and they'll switch on once reachable."
+                )
+            if active and all((s.get("site_type") == "aggregator") for s in active):
+                lines.append(
+                    "\n⚠️ Everything live right now is an aggregator feed — "
+                    "I'd suggest `/addsource` with a publication you trust "
+                    "for first-party coverage."
                 )
             lines.append(
                 f"\nWant to fine-tune? `/sources {stream_id}` shows the full list — "
@@ -262,6 +417,35 @@ A couple of options:
         logger.exception("Background research failed")
         store.update_stream_status(stream_id, "active")
         await send_rich_async(chat_id, f"❌ Research error: {e}")
+
+
+async def _reconcile_sources(sources: list[dict]) -> dict[int, int]:
+    """
+    §2.4: snapshot each freshly stored source once and count what it lists.
+    Catches whole classes of feed-selection bugs at research time instead of
+    silently, days later. Pure reads — baselining still happens on the first
+    news cycle. Failures count as 0 items (worth flagging, not crashing).
+    """
+    from pipeline.fetch_news import snapshot_source, UNCHANGED
+
+    async def _count(src: dict) -> tuple[int, int]:
+        try:
+            snap = await snapshot_source(dict(src))
+            n = 0 if snap is UNCHANGED else len(snap)
+        except Exception:
+            n = 0
+        return src["id"], n
+
+    if not sources:
+        return {}
+    results = await asyncio.gather(*(_count(s) for s in sources),
+                                   return_exceptions=True)
+    counts = {}
+    for r in results:
+        if not isinstance(r, Exception):
+            sid, n = r
+            counts[sid] = n
+    return counts
 
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -432,6 +616,13 @@ async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await send_rich_async(chat_id, "❌ That stream isn't yours.")
         return
 
+    if len(store.get_sources_by_stream(stream_id)) >= config.MAX_SOURCES_PER_STREAM:
+        await send_rich_async(
+            chat_id,
+            f"This stream already follows {config.MAX_SOURCES_PER_STREAM} sources "
+            f"— that's the cap. Drop one with `/deletesource <id>` first.")
+        return
+
     url = context.args[1]
     if "://" not in url:
         url = f"https://{url}"
@@ -534,20 +725,29 @@ silently, and you'll only hear about what appears *after* that.\
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _delete_source_for(user_id: int, source_id: int) -> tuple[bool, str]:
-    """Delete a source if the caller owns its stream. Returns (ok, message)."""
+    """
+    Remove a source from the caller's stream(s). Sources are canonical now —
+    "deleting" unsubscribes THIS user's streams; the row itself only goes away
+    once nobody follows it anymore.
+    """
     src = store.get_source(source_id)
     if not src:
         return False, (f"❌ No source with ID `{source_id}`.\n\n"
                        f"Use `/sources <stream_id>` — the **ID** column is what "
                        f"you pass here, not the row position.")
 
-    owns, _ = await _owns_stream(user_id, src["stream_id"])
-    if not owns:
-        return False, "❌ That source belongs to someone else's stream."
+    # Which of the caller's streams actually follow it?
+    subscribed = [
+        s["id"] for s in store.get_streams_by_user(user_id)
+        if any(x["id"] == source_id for x in store.get_sources_by_stream(s["id"]))
+    ]
+    if not subscribed:
+        return False, "❌ That source isn't on any of your streams."
 
-    store.delete_source(source_id)
+    for sid in subscribed:
+        store.unsubscribe(sid, source_id)
     name = src.get("name") or src["url"]
-    return True, f"🗑️ Deleted source `{source_id}` — {name}"
+    return True, f"🗑️ Removed source `{source_id}` — {name}"
 
 
 async def cmd_deletesource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -587,6 +787,41 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(
             ("🗑️ Deleted." if ok else "Couldn't delete that one."))
         await send_rich_async(chat_id, msg)
+        return
+
+    # ── Delete a stream (confirmation tap from /deletestream) ────────
+    if data.startswith("del_stream:"):
+        arg = data.split(":", 1)[1]
+        if arg == "cancel":
+            await query.edit_message_text("Kept — nothing was deleted.")
+            return
+        stream_id = int(arg)
+        owns, stream = await _owns_stream(user_id, stream_id)
+        if stream is None or not owns:
+            await query.edit_message_text("That stream isn't yours.")
+            return
+        store.delete_stream(stream_id)
+        await query.edit_message_text(f"🗑 Deleted \"{stream['name']}\" and "
+                                      f"unsubscribed its sources.")
+        return
+
+    # ── 👍/👎 feedback on a delivered post (§3.7) ─────────────────────
+    if data.startswith("fb:"):
+        try:
+            _, aid, sid, verdict = data.split(":", 3)
+            article_id, stream_id = int(aid), int(sid)
+        except ValueError:
+            await query.answer("Malformed feedback.")
+            return
+        owns, _stream = await _owns_stream(user_id, stream_id)
+        if not owns:
+            return  # feedback only counts from the stream's owner
+        if verdict in ("up", "down"):
+            store.set_delivery_verdict(article_id, stream_id, verdict)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass  # markup already gone (double tap) — the verdict stuck
         return
 
     # ── Post length ───────────────────────────────────────────────────
@@ -727,6 +962,11 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await send_rich_async(update.effective_chat.id, "❌ That stream isn't yours.")
         return
 
+    allowed, why = _research_allowed(update.effective_user.id)
+    if not allowed:
+        await send_rich_async(update.effective_chat.id, why)
+        return
+
     store.update_stream_status(stream_id, "researching")
     await send_rich_async(update.effective_chat.id, f"🔬 Re-running research for stream `{stream_id}`...")
 
@@ -745,7 +985,9 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         answers = criteria  # legacy stream from before intake preservation
 
-    asyncio.create_task(_run_research_background(stream_id, answers, chat_id, context))
+    asyncio.create_task(_run_research_background(
+        stream_id, answers, chat_id, context,
+        user_id=update.effective_user.id))
 
     await send_rich_async(update.effective_chat.id, "Research started in background. I'll update you with results.")
 
@@ -813,12 +1055,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     conn = get_connection()
 
     stream_count = conn.execute("SELECT COUNT(*) as c FROM streams").fetchone()["c"]
+    paused_streams = conn.execute("SELECT COUNT(*) as c FROM streams WHERE status = 'paused'").fetchone()["c"]
     source_count = conn.execute("SELECT COUNT(*) as c FROM sources").fetchone()["c"]
     active_sources = conn.execute("SELECT COUNT(*) as c FROM sources WHERE fetch_status = 'active'").fetchone()["c"]
     pending_baseline = conn.execute("SELECT COUNT(*) as c FROM sources WHERE baselined_at IS NULL").fetchone()["c"]
+    subscriptions = conn.execute("SELECT COUNT(*) as c FROM stream_sources").fetchone()["c"]
     article_count = conn.execute("SELECT COUNT(*) as c FROM articles").fetchone()["c"]
-    queued = conn.execute("SELECT COUNT(*) as c FROM articles WHERE status = 'new'").fetchone()["c"]
-    posted = conn.execute("SELECT COUNT(*) as c FROM articles WHERE status = 'posted'").fetchone()["c"]
+    queued = conn.execute("SELECT COUNT(*) as c FROM deliveries WHERE status = 'new'").fetchone()["c"]
+    posted = conn.execute("SELECT COUNT(*) as c FROM deliveries WHERE status = 'posted'").fetchone()["c"]
+    duplicates = conn.execute("SELECT COUNT(*) as c FROM deliveries WHERE status = 'duplicate'").fetchone()["c"]
 
     conn.close()
 
@@ -827,15 +1072,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 | Metric | Value |
 |--------|-------|
-| Streams | {stream_count} |
-| Total Sources | {source_count} |
+| Streams | {stream_count} ({paused_streams} paused) |
+| Canonical Sources | {source_count} |
 | Active Sources | {active_sources} |
+| Subscriptions | {subscriptions} |
 | Awaiting Baseline | {pending_baseline} |
 | Articles Tracked | {article_count} |
 | Queued to Post | {queued} |
 | Posted | {posted} |
+| Dup-suppressed | {duplicates} |
 
 ---
 *The news cycle runs every {config.NEWS_CYCLE_MINUTES} min — up to {config.MAX_NEW_PER_SOURCE} new \
-articles per source, {config.MAX_POSTS_PER_CYCLE} posts per cycle.*\
+articles per source, {config.MAX_POSTS_PER_STREAM_PER_CYCLE} posts per stream \
+({config.MAX_POSTS_PER_CYCLE} global) per cycle.*\
 """)

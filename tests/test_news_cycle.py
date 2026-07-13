@@ -1,12 +1,12 @@
-"""F1 (per-stream delivery), F3 (circuit breaker), F6 (flood guard) — integration
-against a real temp SQLite DB with only snapshot_source stubbed."""
+"""Phase A on schema v2: shared-source fan-out, per-stream dedup, baseline,
+flood guard, circuit breaker, polling tiers, conditional GET."""
 import pytest
 
 import config
 import pipeline.news_cycle as nc
 from database import store
 from database.models import get_connection
-from pipeline.fetch_news import SourceFetchError
+from pipeline.fetch_news import SourceFetchError, UNCHANGED
 
 
 def _mk(user_id, url, baselined=True):
@@ -33,16 +33,46 @@ def _item(h, title="Title long enough to pass"):
             "content_hash": h}
 
 
-def _statuses(source_id):
+def _delivery_statuses(stream_id):
     conn = get_connection()
     rows = conn.execute(
-        "SELECT content_hash, status FROM articles WHERE source_id = ?", (source_id,)
-    ).fetchall()
+        """SELECT a.content_hash, d.status FROM deliveries d
+           JOIN articles a ON d.article_id = a.id WHERE d.stream_id = ?""",
+        (stream_id,)).fetchall()
     conn.close()
     return {r["content_hash"]: r["status"] for r in rows}
 
 
-# ── F1: per-stream delivery ───────────────────────────────────────────────────
+def _article_hashes(source_id):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT content_hash FROM articles WHERE source_id = ?", (source_id,)
+    ).fetchall()
+    conn.close()
+    return {r["content_hash"] for r in rows}
+
+
+# ── Fan-out on the shared canonical source (the §2.1 keystone) ────────────────
+
+async def test_shared_source_polled_once_delivered_to_both(temp_db, monkeypatch):
+    s1 = store.create_stream(user_id=1, name="a", criteria={})
+    s2 = store.create_stream(user_id=2, name="b", criteria={})
+    src = store.add_source(stream_id=s1, url="https://tc.com")
+    store.subscribe(s2, src)
+    store.mark_source_baselined(src)
+
+    polls = []
+    async def fake_snap(source):
+        polls.append(source["id"])
+        return [_item("STORY")]
+    monkeypatch.setattr(nc, "snapshot_source", fake_snap)
+
+    baselined, queued = await nc._baseline_and_fetch_phase()
+    assert polls == [src]                    # ONE crawl for two subscribers
+    assert queued == 2
+    assert _delivery_statuses(s1) == {"STORY": "new"}
+    assert _delivery_statuses(s2) == {"STORY": "new"}
+
 
 async def test_same_article_delivered_to_both_streams(temp_db, monkeypatch):
     s1, srcA = _mk(1, "https://a.com")
@@ -55,8 +85,8 @@ async def test_same_article_delivered_to_both_streams(temp_db, monkeypatch):
     baselined, queued = await nc._baseline_and_fetch_phase()
     assert baselined == 0
     assert queued == 2                       # ← the old global dedup gave 1
-    assert _statuses(srcA) == {"SHARED": "new"}
-    assert _statuses(srcB) == {"SHARED": "new"}
+    assert _delivery_statuses(s1) == {"SHARED": "new"}
+    assert _delivery_statuses(s2) == {"SHARED": "new"}
 
 
 async def test_intra_stream_cross_source_dedup(temp_db, monkeypatch):
@@ -77,16 +107,18 @@ async def test_intra_stream_cross_source_dedup(temp_db, monkeypatch):
 
 async def test_already_seen_hash_not_requeued(temp_db, monkeypatch):
     sid, src = _mk(1, "https://a.com")
-    store.add_article(source_id=src, title="t", url="u",
-                      content_hash="OLD", status="posted")
+    aid = store.add_article(source_id=src, title="t", url="u", content_hash="OLD")
+    store.create_delivery(aid, sid)
+    store.mark_delivery_posted(aid, sid, "<b>x</b>")
     monkeypatch.setattr(nc, "snapshot_source", _snapshots({
         "https://a.com": [_item("OLD"), _item("NEW")],
     }))
 
     _, queued = await nc._baseline_and_fetch_phase()
     assert queued == 1
-    assert _statuses(src)["NEW"] == "new"
-    assert _statuses(src)["OLD"] == "posted"  # untouched
+    statuses = _delivery_statuses(sid)
+    assert statuses["NEW"] == "new"
+    assert statuses["OLD"] == "posted"  # untouched
 
 
 async def test_first_poll_baselines_silently(temp_db, monkeypatch):
@@ -97,11 +129,30 @@ async def test_first_poll_baselines_silently(temp_db, monkeypatch):
 
     baselined, queued = await nc._baseline_and_fetch_phase()
     assert baselined == 1 and queued == 0
-    assert set(_statuses(src).values()) == {"seen"}
+    assert _article_hashes(src) == {"H1", "H2"}      # recorded…
+    assert _delivery_statuses(sid) == {}             # …but nothing queued
     assert store.get_source(src)["baselined_at"] is not None
 
 
-# ── F6: flood guard ───────────────────────────────────────────────────────────
+async def test_late_subscriber_gets_no_backfill(temp_db, monkeypatch):
+    # A stream subscribing to an established source must not receive that
+    # source's history — only what appears after it joined.
+    s1, src = _mk(1, "https://a.com")
+    store.add_article(source_id=src, title="old", url="u", content_hash="OLD")
+
+    s2 = store.create_stream(user_id=2, name="late", criteria={})
+    store.subscribe(s2, src)
+    monkeypatch.setattr(nc, "snapshot_source", _snapshots({
+        "https://a.com": [_item("OLD"), _item("FRESH")],
+    }))
+
+    _, queued = await nc._baseline_and_fetch_phase()
+    assert queued == 2                               # FRESH → both streams
+    assert "OLD" not in _delivery_statuses(s2)
+    assert _delivery_statuses(s2) == {"FRESH": "new"}
+
+
+# ── Flood guard ───────────────────────────────────────────────────────────────
 
 def test_looks_like_rebaseline_boundaries():
     assert nc._looks_like_rebaseline(8, 10) is True          # 80% of 10
@@ -118,16 +169,15 @@ async def test_wholesale_change_rebaselines_instead_of_posting(temp_db, monkeypa
 
     _, queued = await nc._baseline_and_fetch_phase()
     assert queued == 0
-    statuses = _statuses(src)
-    assert len(statuses) == 10
-    assert set(statuses.values()) == {"seen"}
+    assert len(_article_hashes(src)) == 10                   # recorded silently
+    assert _delivery_statuses(sid) == {}
 
 
 async def test_normal_trickle_still_queued(temp_db, monkeypatch):
     sid, src = _mk(1, "https://a.com")
     for i in range(8):                                       # 8 known, 2 new
         store.add_article(source_id=src, title="t", url=f"u{i}",
-                          content_hash=f"K{i}", status="seen")
+                          content_hash=f"K{i}")
     items = [_item(f"K{i}") for i in range(8)] + [_item("N1"), _item("N2")]
     monkeypatch.setattr(nc, "snapshot_source", _snapshots({"https://a.com": items}))
 
@@ -135,7 +185,7 @@ async def test_normal_trickle_still_queued(temp_db, monkeypatch):
     assert queued == 2
 
 
-# ── F3: circuit breaker ───────────────────────────────────────────────────────
+# ── Circuit breaker ───────────────────────────────────────────────────────────
 
 async def test_systemic_failure_does_not_count_against_sources(temp_db, monkeypatch):
     urls = [f"https://s{i}.com" for i in range(4)]
@@ -180,3 +230,46 @@ async def test_third_isolated_failure_deactivates(temp_db, monkeypatch):
     for _ in range(config.MAX_CONSECUTIVE_FETCH_FAILURES):
         await nc._baseline_and_fetch_phase()
     assert store.get_source(srcs[0])["fetch_status"] == "error"
+
+
+# ── §2.6: conditional GET + polling tiers ─────────────────────────────────────
+
+async def test_unchanged_snapshot_resets_failcount_and_stops(temp_db, monkeypatch):
+    sid, src = _mk(1, "https://a.com")
+    conn = get_connection()
+    conn.execute("UPDATE sources SET fail_count = 2 WHERE id = ?", (src,))
+    conn.commit(); conn.close()
+
+    async def fake_snap(source):
+        return UNCHANGED
+    monkeypatch.setattr(nc, "snapshot_source", fake_snap)
+
+    _, queued = await nc._baseline_and_fetch_phase()
+    assert queued == 0
+    s = store.get_source(src)
+    assert s["fail_count"] == 0                        # a 304 is a healthy fetch
+    assert s["last_fetched"] is not None
+
+
+def test_due_for_poll_tiers():
+    rss = {"fetch_method": "rss", "pub_frequency": "monthly",
+           "last_fetched": "2026-07-13 00:00:00"}
+    assert nc._due_for_poll(rss) is True               # RSS always polls (304s)
+
+    from datetime import datetime, timezone
+    now = datetime(2026, 7, 13, 2, 0, tzinfo=timezone.utc)
+    recent = {"fetch_method": "links", "pub_frequency": "monthly",
+              "last_fetched": "2026-07-13 00:00:00"}
+    assert nc._due_for_poll(recent, now) is False      # 2h < 12h tier
+
+    stale = {"fetch_method": "links", "pub_frequency": "monthly",
+             "last_fetched": "2026-07-12 00:00:00"}
+    assert nc._due_for_poll(stale, now) is True        # 26h > 12h tier
+
+    daily = {"fetch_method": "links", "pub_frequency": "daily",
+             "last_fetched": "2026-07-13 01:59:00"}
+    assert nc._due_for_poll(daily, now) is True        # daily tier never waits
+
+    never = {"fetch_method": "links", "pub_frequency": "weekly",
+             "last_fetched": None}
+    assert nc._due_for_poll(never, now) is True        # unbaselined: always due

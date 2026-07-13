@@ -215,6 +215,68 @@ hours, feedback loop, CI) written so any future session can execute it.
 account; pin `crawl4ai` to the server's deployed version; watch the 🩺 self-check
 message on first boot (it will reveal whether the embeddings endpoint actually works).
 
+### Jul 13, 2026 — The roadmap, executed (schema v2 + product gaps)
+
+Nearly everything in `SUGGESTIONS.md` implemented in one pass, verified by a suite
+grown to 118 offline tests, migrated and redeployed live. Explicitly skipped:
+§1.1 summarize+gate merge (operator decision — they stay separate calls), §2.2
+worker split and §3.4 Firecrawl ladder (deferred, see SUGGESTIONS.md).
+
+**§2.1 — THE schema split (canonical sources).** `sources` are now tenant-free
+and UNIQUE per feed page; streams follow them through `stream_sources` (per-stream
+`quality_score` lives on the subscription); `articles` hold one row per (source,
+story); `deliveries` hold per-(article, stream) state — status, attempts,
+`post_html`, `verdict`. Ten streams following TechCrunch now cost ONE crawl per
+cycle. The v1 database migrates in place at boot (old tables kept as
+`sources_v1`/`articles_v1`); migration verified against a copy of the production
+DB and then live (283 articles → 283 articles + 45 deliveries, zero loss).
+`MAX_POSTS_PER_CYCLE` is now per-stream (`MAX_POSTS_PER_STREAM_PER_CYCLE=5`,
+global ceiling 30) so one noisy stream can't starve other tenants.
+
+**§3.1 — stream lifecycle.** `/pausestream`, `/resumestream`, `/deletestream`
+(with confirm tap). A paused stream's sources are no longer crawled at all
+(get_active_sources joins subscriptions → active streams). Streams whose owner
+blocked the bot auto-pause after 3 consecutive terminal send failures, with an
+admin notification.
+
+**§2.6 — polling economics.** RSS polls send `If-None-Match`/`If-Modified-Since`
+and treat 304 as "nothing changed" (validators stored per source). Non-RSS
+sources poll on tiers derived from the qualifier's judged `frequency`
+(daily=every tick, weekly=4h, monthly=12h, rare=24h).
+
+**§3.2 — story-level semantic dedup.** Each Phase-B candidate is embedded and
+cosine-compared against what its stream already posted in the last 72h; ≥0.85 →
+status `duplicate`, nothing sent. Degrades to a no-op if embeddings fail.
+(The startup self-check confirmed the embeddings endpoint works.)
+
+**§2.5 — the source cache finally pays.** Internal-DB matches with similarity
+≥0.75 skip the Stage-1 prefilter and go straight to deep qualification.
+
+**§3.3 — usage accounting.** `usage(user_id, day, kind, n)` table; every LLM
+call, crawl, and embedding request is attributed via a contextvar (research runs
+→ the requesting user, cycle work → system). Caps: 3 research runs/user/day,
+5 streams/user, 15 sources/stream.
+
+**§3.7 — feedback loop.** Every post carries 👍/👎 inline buttons (verdict stored
+per delivery, owner-only). A nightly job folds gate pass-rate + thumb ratio into
+subscription quality_score (gentle EMA) and reports persistently bad sources to
+the admin instead of auto-dropping them.
+
+**Also shipped:** §3.5 exact sent post persisted (`deliveries.post_html`);
+§3.6 `/quiet <id> 23-8` quiet hours (posts held, not lost, no attempt charged);
+§3.8 untrusted-content clauses in summarizer/post-writer/inline-extractor
+prompts; §3.9 posts written in the stream's interview language; §3.10
+`PicklePersistence` so a deploy mid-interview no longer eats the conversation;
+§2.3 batched Phase-A inserts + nightly retention (30 days, keeps posted/queued
+rows for provenance); §2.4 research reconciliation — after research, every
+stored source is snapshotted once and the report says which are live vs pending,
+and flags all-aggregator results; §4.1 crawl4ai pinned to 0.9.1; §4.2 GitHub
+Actions CI running the offline suite on every push.
+
+**Verified:** 118 tests green; live migration + boot clean; startup self-check OK;
+first post-deploy news cycle ran against real sources without errors.
+DB backup at `data/news.db.pre-v2-backup`.
+
 ---
 
 ## Tech Stack

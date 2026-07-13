@@ -1,0 +1,24 @@
+# §4.2 — keep the offline suite honest on every push.
+# Installs the light deps only: the tests never launch a browser, so crawl4ai
+# (and its Playwright/Chromium payload) stays out of CI.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install light dependencies (no crawl4ai)
+        run: |
+          grep -viE '^(#|crawl4ai)' requirements.txt > /tmp/reqs-ci.txt
+          pip install -r /tmp/reqs-ci.txt pytest pytest-asyncio
+      - name: Run the offline suite
+        run: python -m pytest tests/ -q

@@ -93,3 +93,35 @@ async def test_failed_prefilter_chunk_loses_only_its_candidates(monkeypatch):
     result = await qual.qualify_all(candidates, {})
     assert len(result) == 1
     assert result[0]["url"] == "https://s15.com"   # id 16 = 16th candidate
+
+
+# ── §2.5: internal-DB matches skip the Stage-1 prefilter ─────────────────────
+
+async def test_priority_urls_bypass_prefilter(monkeypatch):
+    import json
+
+    async def fake_fetch_multiple(urls):
+        return [{"url": u, "title": "T", "content": "some content", "html": "",
+                 "links": [], "success": True, "error": None} for u in urls]
+
+    prefilter_calls = []
+
+    async def fake_chat_json(system, user, model="fast"):
+        if "fast source qualification" in system:
+            prefilter_calls.append(user)
+            return {"results": []}          # prefilter rejects EVERYTHING
+        # deep qualification result
+        return {"covers_topic": True, "match_score": 88,
+                "recommendation": "accept", "source_name": "Cached",
+                "feed_url": "https://cached.com/news", "frequency": "daily"}
+
+    monkeypatch.setattr(qual, "fetch_multiple", fake_fetch_multiple)
+    monkeypatch.setattr(qual, "chat_json", fake_chat_json)
+
+    out = await qual.qualify_all(
+        ["https://cached.com", "https://random.com"], {"strictness": "medium"},
+        priority_urls={"https://cached.com"})
+
+    # The prefilter rejected everything, but the cached source still made it
+    # through deep qualification.
+    assert [q["url"] for q in out] == ["https://cached.com"]

@@ -12,6 +12,7 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     CallbackQueryHandler,
+    PicklePersistence,
     filters,
 )
 
@@ -32,6 +33,10 @@ from bot.handlers import (
     cmd_runpipeline,
     cmd_status,
     cmd_postsize,
+    cmd_pausestream,
+    cmd_resumestream,
+    cmd_deletestream,
+    cmd_quiet,
     # Conversation handler (single natural interview loop)
     handle_interview,
     cancel_conversation,
@@ -161,8 +166,16 @@ async def _post_shutdown(app: Application) -> None:
 
 def build_application() -> Application:
     """Build and configure the Telegram bot application."""
+    # §3.10: user_data (the running interview transcript) survives restarts —
+    # a deploy mid-interview no longer silently eats the conversation.
+    import os
+    persistence = PicklePersistence(
+        filepath=os.path.join(os.path.dirname(config.DB_PATH), "bot_state.pickle")
+    )
+
     app = (Application.builder()
            .token(config.TELEGRAM_BOT_TOKEN)
+           .persistence(persistence)
            .post_shutdown(_post_shutdown)
            .build())
 
@@ -174,6 +187,8 @@ def build_application() -> Application:
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
         allow_reentry=True,
+        name="newstream_interview",
+        persistent=True,
     )
 
     # ── Error handler ─────────────────────────────────────────────────────
@@ -194,6 +209,10 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("runpipeline", cmd_runpipeline))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("postsize", cmd_postsize))
+    app.add_handler(CommandHandler("pausestream", cmd_pausestream))
+    app.add_handler(CommandHandler("resumestream", cmd_resumestream))
+    app.add_handler(CommandHandler("deletestream", cmd_deletestream))
+    app.add_handler(CommandHandler("quiet", cmd_quiet))
     # Inline keyboards are inert without this.
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(error_handler)
@@ -227,6 +246,26 @@ def setup_scheduler(app: Application) -> None:
         first=config.HEALTH_CHECK_INTERVAL_HOURS * 3600,
         name="health_check",
     )
+
+    # Nightly retention (§2.3): the articles table grew unboundedly and
+    # nothing ever read the dead rows again.
+    async def cron_retention(context):
+        from database import store
+        try:
+            n = store.prune_old_articles(config.RETENTION_DAYS)
+            if n:
+                logger.info("Retention: pruned %d article(s) older than %d days",
+                            n, config.RETENTION_DAYS)
+        except Exception:
+            logger.exception("Retention job failed")
+
+    job_queue.run_repeating(cron_retention, interval=24 * 3600, first=3600,
+                            name="retention")
+
+    # Nightly feedback fold (§3.7): 👍/👎 + gate pass-rate → quality_score.
+    from pipeline.feedback import cron_score_decay
+    job_queue.run_repeating(cron_score_decay, interval=24 * 3600, first=2 * 3600,
+                            name="score_decay")
 
     # One-shot dependency self-check shortly after boot
     job_queue.run_once(startup_selfcheck, when=15, name="startup_selfcheck")

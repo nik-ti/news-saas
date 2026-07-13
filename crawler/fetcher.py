@@ -75,6 +75,8 @@ async def fetch_page(url: str) -> Optional[dict]:
     async with _crawl_semaphore:
         try:
             from crawl4ai import CrawlerRunConfig, CacheMode
+            from pipeline import usage
+            usage.record("crawl")
 
             crawler = await _get_crawler()
             run_config = CrawlerRunConfig(

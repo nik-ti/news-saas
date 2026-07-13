@@ -1,8 +1,17 @@
-"""F7 (RSS fail-hard + XML guard) and F11 (query-string permalink dedup)."""
+"""F7 (RSS fail-hard + XML guard), F11 (query-string permalink dedup), and
+§2.6 conditional GET."""
 import pytest
 
 import pipeline.fetch_news as fn
-from pipeline.fetch_news import SourceFetchError, _dedup_key, _item, snapshot_source
+from pipeline.fetch_news import (SourceFetchError, UNCHANGED, _dedup_key,
+                                 _item, snapshot_source)
+
+
+def _conditional(items_or_unchanged, meta=None):
+    """Stub for fetch_rss_conditional returning fixed items/meta."""
+    async def fake(feed_url, etag="", last_modified=""):
+        return items_or_unchanged, (meta or {})
+    return fake
 
 
 # ── F11: dedup key ────────────────────────────────────────────────────────────
@@ -43,15 +52,13 @@ def test_item_hash_uses_dedup_key():
 # ── F7: RSS fail-hard ─────────────────────────────────────────────────────────
 
 async def test_proven_rss_source_raises_on_empty_feed(monkeypatch):
-    async def empty_rss(url):
-        return []
     fetch_calls = []
 
     async def no_fetch(url):
         fetch_calls.append(url)
         raise AssertionError("browser must not be used for a proven-RSS source")
 
-    monkeypatch.setattr(fn, "fetch_rss_items", empty_rss)
+    monkeypatch.setattr(fn, "fetch_rss_conditional", _conditional([]))
     monkeypatch.setattr(fn, "fetch_page", no_fetch)
 
     source = {"url": "https://ex.com", "feed_url": "https://ex.com/feed",
@@ -64,9 +71,6 @@ async def test_proven_rss_source_raises_on_empty_feed(monkeypatch):
 async def test_sniffed_rss_source_still_falls_through(monkeypatch):
     # Legacy source (no stored method): URL sniff says RSS, feed empty →
     # crawler fallthrough is preserved.
-    async def empty_rss(url):
-        return []
-
     async def fake_fetch(url):
         return {"success": True, "content": "x" * 300, "title": "t",
                 "html": "", "links": [], "url": url, "error": None}
@@ -74,7 +78,7 @@ async def test_sniffed_rss_source_still_falls_through(monkeypatch):
     async def no_items(feed_url, page):
         return []
 
-    monkeypatch.setattr(fn, "fetch_rss_items", empty_rss)
+    monkeypatch.setattr(fn, "fetch_rss_conditional", _conditional([]))
     monkeypatch.setattr(fn, "fetch_page", fake_fetch)
     monkeypatch.setattr(fn, "_extract_inline_items", no_items)
 
@@ -82,6 +86,59 @@ async def test_sniffed_rss_source_still_falls_through(monkeypatch):
               "fetch_method": None}
     items = await snapshot_source(source)
     assert items == []
+
+
+# ── §2.6: conditional GET ─────────────────────────────────────────────────────
+
+async def test_304_returns_unchanged_sentinel(monkeypatch):
+    monkeypatch.setattr(fn, "fetch_rss_conditional",
+                        _conditional(UNCHANGED, {"etag": "abc"}))
+    source = {"url": "https://ex.com", "feed_url": "https://ex.com/feed",
+              "fetch_method": "rss", "etag": "abc"}
+    assert await snapshot_source(source) is UNCHANGED
+
+
+async def test_fresh_read_hands_back_new_validators(monkeypatch):
+    monkeypatch.setattr(fn, "fetch_rss_conditional", _conditional(
+        [{"title": "Long enough headline here", "url": "https://ex.com/1",
+          "summary": ""}],
+        {"etag": 'W/"new"', "last_modified": "Sun, 13 Jul 2026 00:00:00 GMT"}))
+    source = {"url": "https://ex.com", "feed_url": "https://ex.com/feed",
+              "fetch_method": "rss"}
+    items = await snapshot_source(source)
+    assert len(items) == 1
+    assert source["_new_etag"] == 'W/"new"'
+    assert source["_new_last_modified"] == "Sun, 13 Jul 2026 00:00:00 GMT"
+
+
+async def test_conditional_get_sends_validators_and_handles_304(monkeypatch):
+    """fetch_rss_conditional itself: request headers + 304 handling."""
+    seen_headers = {}
+
+    class FakeResp:
+        status_code = 304
+        headers = {}
+        text = ""
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def get(self, url, timeout=None, headers=None):
+            seen_headers.update(headers or {})
+            return FakeResp()
+
+    monkeypatch.setattr(fn.httpx, "AsyncClient", FakeClient)
+    items, meta = await fn.fetch_rss_conditional(
+        "https://ex.com/feed", etag='W/"x"',
+        last_modified="Sat, 12 Jul 2026 00:00:00 GMT")
+    assert items is UNCHANGED
+    assert seen_headers["If-None-Match"] == 'W/"x"'
+    assert seen_headers["If-Modified-Since"] == "Sat, 12 Jul 2026 00:00:00 GMT"
+    assert meta["etag"] == 'W/"x"'                      # validators preserved
 
 
 # ── F7: XML guard on inline extraction ───────────────────────────────────────

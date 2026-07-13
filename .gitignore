@@ -12,10 +12,8 @@ __pycache__/
 .venv/
 venv/
 
-# Database
-data/*.db
-data/*.db-wal
-data/*.db-shm
+# Database + runtime state (backups, PTB persistence pickle)
+data/
 
 # OS
 .DS_Store

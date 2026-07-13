@@ -89,12 +89,19 @@ Be strict. No evidence = reject."""
 
 
 async def qualify_all(candidates: list[str], profile: dict,
-                      progress_callback=None) -> list[dict]:
+                      progress_callback=None,
+                      priority_urls: set[str] = None) -> list[dict]:
     """
     Two-stage qualification pipeline.
     Stage 1: Quick parallel homepage fetch + batch LLM pre-filter.
     Stage 2: Deep qualification on survivors only — includes feed_url identification.
+
+    `priority_urls` (§2.5): candidates already known-good from the internal
+    source DB (high semantic similarity). They skip the Stage-1 LLM verdict
+    and go straight to deep qualification — the cache finally pays for the
+    phase that costs something, not just discovery.
     """
+    priority_urls = priority_urls or set()
     total = len(candidates)
     logger.info("Qualifying %d candidates (2-stage funnel)...", total)
 
@@ -166,6 +173,12 @@ async def qualify_all(candidates: list[str], profile: dict,
             verdict = r.get("verdict") or "skip"
             if verdict == "investigate" and src_id in url_to_index:
                 promising[src_id] = score
+
+    # Priority (internal-DB) candidates bypass the prefilter verdict entirely —
+    # a fetched homepage is all they need to proceed.
+    for src_id, url in url_to_index.items():
+        if url in priority_urls and src_id not in promising:
+            promising[src_id] = 100
 
     # Sort by score, take top candidates for deep dive
     sorted_promising = sorted(promising.items(), key=lambda x: x[1], reverse=True)

@@ -44,6 +44,8 @@ async def _openrouter_embeddings(model: str, inputs: list[str]) -> list[list[flo
     doesn't cover embeddings). Returns one vector per input, in order.
     """
     import httpx
+    from pipeline import usage
+    usage.record("embed_call")
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -65,6 +67,8 @@ async def chat(system_prompt: str, user_prompt: str, model: str = "fast") -> str
     `model` picks the tier: "fast" | "smart" | "post".
     """
     from langchain_core.messages import HumanMessage, SystemMessage
+    from pipeline import usage
+    usage.record("llm_call")
 
     response = await _get_llm(model).ainvoke([
         SystemMessage(content=system_prompt),

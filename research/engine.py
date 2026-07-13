@@ -181,8 +181,19 @@ async def node_qualify(state: ResearchState,
     async def progress_cb(done: int, total: int):
         await progress(f"   ⏳ Qualified {done}/{total}...")
 
+    # §2.5: internal-DB matches similar enough to trust skip the Stage-1
+    # prefilter and go straight to deep qualification.
+    priority = {
+        m["url"] for m in state.get("db_matches", [])
+        if (m.get("similarity") or 0) >= config.CACHE_SKIP_STAGE1_SIMILARITY
+    }
+    if priority:
+        logger.info("Internal-DB fast path: %d cached source(s) skip Stage 1",
+                    len(priority))
+
     qualified = await qualify_all(candidates, state["profile"],
-                                  progress_callback=progress_cb)
+                                  progress_callback=progress_cb,
+                                  priority_urls=priority)
 
     # ── Deterministic domain-level dedup ────────────────────────────────
     before_dedup = len(qualified)
@@ -233,6 +244,9 @@ def _to_source_dict(q: dict, fetch_status: str = "active") -> dict:
         "fetch_status": fetch_status,
         "feed_url": _feed_url_of(q),
         "fetch_method": _fetch_method_of(q),
+        # The qualifier's judged publishing frequency drives the polling tier
+        # (§2.6) — a monthly blog doesn't need 48 crawls a day.
+        "pub_frequency": q.get("frequency") or "",
     }
 
 

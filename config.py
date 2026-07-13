@@ -41,9 +41,31 @@ MAX_CONSECUTIVE_FETCH_FAILURES = 3  # deactivate a source only after N failed cy
 # ── Pipeline / Cron ───────────────────────────────────────────────────────────
 NEWS_CYCLE_MINUTES = 30          # the one cron: poll sources → gate → post
 MAX_NEW_PER_SOURCE = 3           # new articles queued per source per cycle
-MAX_POSTS_PER_CYCLE = 10         # global cap on messages sent per cycle
+MAX_POSTS_PER_CYCLE = 30         # global safety ceiling on messages per cycle
+MAX_POSTS_PER_STREAM_PER_CYCLE = 5  # per-stream budget — one noisy stream can't
+                                    # starve every other tenant anymore
 MAX_ARTICLE_ATTEMPTS = 3         # transient failures before an article is dropped
 HEALTH_CHECK_INTERVAL_HOURS = 24
+RETENTION_DAYS = 30              # nightly prune of dead article rows
+AUTO_PAUSE_SEND_FAILURES = 3     # consecutive terminal send failures → stream paused
+
+# Polling tiers (§2.6): non-RSS sources whose proven publishing frequency is low
+# skip ticks. Hours a source must wait between browser crawls, by frequency.
+POLL_TIER_HOURS = {"daily": 0, "weekly": 4, "monthly": 12, "rare": 24}
+
+# Story-level semantic dedup (§3.2): a candidate whose embedding is closer than
+# this to something already posted to the same stream in the window is a dup.
+STORY_DEDUP_THRESHOLD = 0.85
+STORY_DEDUP_HOURS = 72
+
+# ── Per-user limits (§3.3) ───────────────────────────────────────────────────
+RESEARCH_RUNS_PER_DAY = 3        # /newstream + /research runs per user per day
+MAX_STREAMS_PER_USER = 5
+MAX_SOURCES_PER_STREAM = 15
+
+# Internal source-DB cache (§2.5): a semantic match at least this similar skips
+# the Stage-1 prefilter and goes straight to deep qualification.
+CACHE_SKIP_STAGE1_SIMILARITY = 0.75
 
 # Re-baseline guard: if a KNOWN source suddenly shows this many "new" items and
 # they make up at least this fraction of its page, the page structure changed

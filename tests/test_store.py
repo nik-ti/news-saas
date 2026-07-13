@@ -1,4 +1,5 @@
-"""F1 — per-stream dedup primitives and DB-level uniqueness. F2 — tenant scoping."""
+"""Schema v2 primitives: canonical sources, subscriptions, per-stream dedup,
+tenant scoping, and lifecycle cleanup."""
 from database import store
 from database.models import get_connection
 
@@ -6,6 +7,91 @@ from database.models import get_connection
 def _mk_stream(user_id=1, name="s"):
     return store.create_stream(user_id=user_id, name=name, criteria={"topic": name})
 
+
+# ── Canonical sources + subscriptions ─────────────────────────────────────────
+
+def test_same_feed_collapses_to_one_canonical_source(temp_db):
+    s1 = _mk_stream(1, "a")
+    s2 = _mk_stream(2, "b")
+    src1 = store.add_source(stream_id=s1, url="https://tc.com",
+                            feed_url="https://tc.com/news", quality_score=80)
+    src2 = store.add_source(stream_id=s2, url="https://tc.com",
+                            feed_url="https://tc.com/news", quality_score=40)
+
+    assert src1 == src2  # ONE canonical row, not two
+
+    conn = get_connection()
+    n_sources = conn.execute("SELECT COUNT(*) c FROM sources").fetchone()["c"]
+    n_subs = conn.execute("SELECT COUNT(*) c FROM stream_sources").fetchone()["c"]
+    conn.close()
+    assert n_sources == 1
+    assert n_subs == 2
+
+    # quality_score is per subscription, not per site.
+    assert store.get_sources_by_stream(s1)[0]["quality_score"] == 80
+    assert store.get_sources_by_stream(s2)[0]["quality_score"] == 40
+
+
+def test_upsert_fills_blank_metadata_only(temp_db):
+    s1 = _mk_stream()
+    store.add_source(stream_id=s1, url="https://a.com", feed_url="https://a.com/f",
+                     fetch_method="rss")
+    # Second add must not clobber the proven fetch_method.
+    store.add_source(stream_id=s1, url="https://a.com", feed_url="https://a.com/f",
+                     fetch_method="links", name="Named now")
+    src = store.get_sources_by_stream(s1)[0]
+    assert src["fetch_method"] == "rss"
+    assert src["name"] == "Named now"   # blank was filled
+
+
+def test_unsubscribe_drops_orphaned_source(temp_db):
+    s1, s2 = _mk_stream(1), _mk_stream(2)
+    src = store.add_source(stream_id=s1, url="https://a.com")
+    store.subscribe(s2, src)
+
+    store.unsubscribe(s1, src)
+    assert store.get_source(src) is not None       # s2 still follows it
+
+    store.unsubscribe(s2, src)
+    assert store.get_source(src) is None           # orphaned → gone
+
+
+def test_delete_stream_cleans_up_orphaned_sources(temp_db):
+    s1, s2 = _mk_stream(1), _mk_stream(2)
+    only_mine = store.add_source(stream_id=s1, url="https://mine.com")
+    shared = store.add_source(stream_id=s1, url="https://shared.com")
+    store.subscribe(s2, shared)
+
+    store.delete_stream(s1)
+    assert store.get_source(only_mine) is None     # nobody follows it → gone
+    assert store.get_source(shared) is not None    # s2 still needs it
+
+
+def test_get_active_sources_skips_paused_streams_sources(temp_db):
+    # §3.1: a paused stream's sources were still CRAWLED before, just not posted.
+    s1 = _mk_stream(1)
+    store.add_source(stream_id=s1, url="https://a.com")
+    assert len(store.get_active_sources()) == 1
+
+    store.update_stream_status(s1, "paused")
+    assert store.get_active_sources() == []        # no subscriber → no crawl
+
+    store.update_stream_status(s1, "active")
+    assert len(store.get_active_sources()) == 1
+
+
+def test_get_active_sources_returns_distinct_rows(temp_db):
+    # The keystone: ten streams following one feed = ONE row to poll.
+    src_ids = set()
+    for u in range(5):
+        sid = _mk_stream(user_id=u)
+        src_ids.add(store.add_source(stream_id=sid, url="https://tc.com",
+                                     feed_url="https://tc.com/news"))
+    assert len(src_ids) == 1
+    assert len(store.get_active_sources()) == 1
+
+
+# ── Per-stream dedup primitives ───────────────────────────────────────────────
 
 def test_stream_seen_hashes_scoped_per_stream(temp_db):
     s1 = _mk_stream(user_id=1, name="a")
@@ -23,14 +109,24 @@ def test_stream_seen_hashes_scoped_per_stream(temp_db):
     assert "H1" in store.stream_seen_hashes(s2)
 
 
-def test_unique_index_makes_duplicate_insert_noop(temp_db):
+def test_shared_source_hash_seen_by_all_subscribers(temp_db):
+    s1, s2 = _mk_stream(1), _mk_stream(2)
+    src = store.add_source(stream_id=s1, url="https://one.com")
+    store.subscribe(s2, src)
+    store.add_article(source_id=src, title="t", url="u", content_hash="H1")
+
+    assert "H1" in store.stream_seen_hashes(s1)
+    assert "H1" in store.stream_seen_hashes(s2)
+
+
+def test_duplicate_insert_returns_existing_id(temp_db):
     s1 = _mk_stream()
     src = store.add_source(stream_id=s1, url="https://one.com")
 
     first = store.add_article(source_id=src, title="t", url="u", content_hash="H1")
     second = store.add_article(source_id=src, title="t", url="u", content_hash="H1")
     assert first > 0
-    assert second == 0  # ignored, no crash
+    assert second == first  # dup insert is a no-op that finds the original
 
     conn = get_connection()
     n = conn.execute(
@@ -40,9 +136,18 @@ def test_unique_index_makes_duplicate_insert_noop(temp_db):
     assert n == 1
 
 
+def test_batch_insert_is_dup_safe(temp_db):
+    s1 = _mk_stream()
+    src = store.add_source(stream_id=s1, url="https://one.com")
+    items = [{"title": "a", "url": "u1", "content_hash": "H1"},
+             {"title": "b", "url": "u2", "content_hash": "H2"}]
+    ids1 = store.add_articles_batch(src, items)
+    ids2 = store.add_articles_batch(src, items)
+    assert len(ids1) == 2 and all(i > 0 for i in ids1)
+    assert ids2 == ids1                              # second pass finds them
+
+
 def test_same_hash_allowed_on_different_sources(temp_db):
-    # Cross-stream delivery relies on the SAME article existing under
-    # each stream's own source row.
     s1, s2 = _mk_stream(1), _mk_stream(2)
     src1 = store.add_source(stream_id=s1, url="https://one.com")
     src2 = store.add_source(stream_id=s2, url="https://two.com")
@@ -65,35 +170,32 @@ def test_get_latest_articles_for_user_is_tenant_scoped(temp_db):
     assert store.get_latest_articles_for_user(99) == []
 
 
-def test_init_db_survives_legacy_duplicate_articles(tmp_path, monkeypatch):
-    # A DB created before the unique index can hold per-source duplicates.
-    # init_db must fall back gracefully, not crash the bot at startup.
-    import sqlite3
-    import config
-    from database.models import init_db
+# ── Deliveries ────────────────────────────────────────────────────────────────
 
-    db_path = str(tmp_path / "legacy.db")
-    monkeypatch.setattr(config, "DB_PATH", db_path)
-    init_db()
+def test_delivery_lifecycle(temp_db):
+    s1 = _mk_stream()
+    src = store.add_source(stream_id=s1, url="https://a.com")
+    aid = store.add_article(source_id=src, title="t", url="u", content_hash="H")
 
-    conn = sqlite3.connect(db_path)
-    conn.execute("DROP INDEX IF EXISTS uq_articles_src_hash")
-    conn.execute("INSERT INTO streams (user_id, name, criteria) VALUES (1,'s','{}')")
-    conn.execute("INSERT INTO sources (stream_id, url) VALUES (1,'https://a.com')")
-    for _ in range(2):  # the duplicate pair the index would reject
-        conn.execute(
-            "INSERT INTO articles (source_id, title, url, content_hash) "
-            "VALUES (1,'t','u','DUP')")
-    conn.commit()
-    conn.close()
+    assert store.create_delivery(aid, s1) is True
+    assert store.create_delivery(aid, s1) is False   # idempotent
 
-    init_db()  # must not raise
+    store.mark_delivery_posted(aid, s1, "<b>the post</b>")
+    d = store.get_delivery(aid, s1)
+    assert d["status"] == "posted"
+    assert d["post_html"] == "<b>the post</b>"       # §3.5 provenance
+    assert d["posted_at"] is not None
 
-    conn = sqlite3.connect(db_path)
-    n = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-    conn.close()
-    assert n == 2  # data untouched
 
+def test_send_fail_streak(temp_db):
+    s1 = _mk_stream()
+    assert store.record_send_result(s1, ok=False) == 1
+    assert store.record_send_result(s1, ok=False) == 2
+    assert store.record_send_result(s1, ok=True) == 0
+    assert store.record_send_result(s1, ok=False) == 1
+
+
+# ── init_db robustness ────────────────────────────────────────────────────────
 
 def test_init_db_is_idempotent(temp_db):
     # Re-running init_db on an existing DB (with data) must not fail —
