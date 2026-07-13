@@ -33,6 +33,7 @@ from bot.handlers import (
     cmd_runpipeline,
     cmd_status,
     cmd_postsize,
+    cmd_language,
     cmd_pausestream,
     cmd_resumestream,
     cmd_deletestream,
@@ -209,6 +210,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("runpipeline", cmd_runpipeline))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("postsize", cmd_postsize))
+    app.add_handler(CommandHandler("language", cmd_language))
     app.add_handler(CommandHandler("pausestream", cmd_pausestream))
     app.add_handler(CommandHandler("resumestream", cmd_resumestream))
     app.add_handler(CommandHandler("deletestream", cmd_deletestream))

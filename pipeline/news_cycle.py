@@ -412,7 +412,9 @@ async def _post_phase() -> dict:
             post_html = await write_post(
                 summary, title=title, source_url=delivery.get("url", ""),
                 length=profile.get("post_length", "standard"),
-                language=profile.get("language", ""),
+                # Explicit /language choice beats the interview-inferred field.
+                language=(profile.get("post_language")
+                          or profile.get("language", "")),
             )
             if not post_html or len(post_html) < 20:
                 stats[_retry_or_drop(article_id, stream_id,

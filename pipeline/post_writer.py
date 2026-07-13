@@ -134,11 +134,34 @@ def _length_rule(length: str) -> str:
     return _LENGTH_RULES.get(length, _LENGTH_RULES["standard"])
 
 
+# Values meaning Russian/English — the explicit setting writes "ru"/"en", but
+# interview-inferred profiles carry free text ("Russian", "русский", …).
+_RU_VALUES = ("ru", "rus", "russian", "русский", "русский язык")
+_EN_VALUES = ("", "en", "eng", "english", "английский")
+
+_RUSSIAN_RULE = (
+    "posts written ENTIRELY in natural, native Russian — headline included. "
+    "Write as a Russian news editor would, not as a word-for-word translator: "
+    "idiomatic phrasing, Russian sentence rhythm. Keep brand and product names "
+    "in their customary form (OpenAI, iPhone — Latin; Сбербанк — Cyrillic). "
+    "Dates and numbers follow Russian conventions (5 июля 2026). Every other "
+    "rule in this prompt — factual accuracy, plain language, one main point — "
+    "applies to the Russian text exactly as it would to English"
+)
+
+
+def _is_russian(language: str) -> bool:
+    return (language or "").strip().lower() in _RU_VALUES
+
+
 def _language_rule(language: str) -> str:
-    """The interview collects a preferred language — honour it (§3.9)."""
+    """The stream's post language — explicit /language choice or inferred."""
     lang = (language or "").strip().lower()
-    if not lang or lang in ("en", "eng", "english"):
+    if lang in _EN_VALUES:
         return "English-language"
+    if lang in _RU_VALUES:
+        return _RUSSIAN_RULE
+    # Some other inferred language — keep the generic instruction.
     return f"posts written in this language: {language.strip()} — the "\
            f"ENTIRE post, headline included, must be in that language"
 
@@ -174,7 +197,8 @@ async def write_post(summary_text: str, title: str = "", source_url: str = "",
         # Crawled URLs can carry quotes/angle brackets; unescaped they break the
         # anchor and Telegram rejects the whole message with a 400.
         safe_url = html_mod.escape(source_url, quote=True)
-        post = f'{post}\n\n🔗 <a href="{safe_url}">Source</a>'
+        label = "Источник" if _is_russian(language) else "Source"
+        post = f'{post}\n\n🔗 <a href="{safe_url}">{label}</a>'
     return post
 
 
@@ -200,6 +224,10 @@ def _strip_preamble(text: str) -> str:
     skip_patterns = (
         "this article", "the article", "following your", "however",
         "in accordance", "based on", "sure here", "here is", "here's",
+        # Russian meta-preambles — a Russian-language model happily writes
+        # "Вот пост:" before the post; strip it like its English cousins.
+        "вот пост", "вот ваш", "вот готовый", "конечно", "разумеется",
+        "держите", "готово", "этот пост", "данная статья",
     )
     while lines and lines[0].strip().lower().startswith(skip_patterns):
         lines.pop(0)

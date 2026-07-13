@@ -115,6 +115,26 @@ def set_post_length(stream_id: int, length: str) -> bool:
     return set_stream_criteria_field(stream_id, "post_length", length)
 
 
+# ── Users (interface preferences) ────────────────────────────────────────────
+
+def get_ui_lang(user_id: int) -> str:
+    """The user's bot-interface language ('en' | 'ru'). Default: English."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT ui_lang FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return (row["ui_lang"] if row and row["ui_lang"] else "en")
+
+
+def set_ui_lang(user_id: int, lang: str) -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO users (user_id, ui_lang) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET ui_lang = excluded.ui_lang",
+            (user_id, lang),
+        )
+
+
 def record_send_result(stream_id: int, ok: bool) -> int:
     """
     Track consecutive terminal send failures per stream (for auto-pause).

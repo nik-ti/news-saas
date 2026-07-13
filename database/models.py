@@ -97,6 +97,12 @@ CREATE TABLE IF NOT EXISTS deliveries (
     PRIMARY KEY (article_id, stream_id)
 );
 
+CREATE TABLE IF NOT EXISTS users (
+    user_id     INTEGER PRIMARY KEY,     -- Telegram user id
+    ui_lang     TEXT    DEFAULT 'en',    -- bot interface language: en | ru
+    created_at  TEXT    DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS usage (
     user_id INTEGER NOT NULL,
     day     TEXT    NOT NULL,        -- YYYY-MM-DD (UTC)

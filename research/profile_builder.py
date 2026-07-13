@@ -81,9 +81,13 @@ def _format_transcript(transcript: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def interview_turn(transcript: list[dict]) -> dict:
+async def interview_turn(transcript: list[dict], ui_lang: str = "en") -> dict:
     """
     Given the conversation so far, decide the next natural move.
+
+    ui_lang: the user's interface language — the interviewer converses in it
+    (an English system prompt otherwise anchors the model to English replies
+    even when the user writes Russian).
 
     Returns {"enough": bool, "message": str}:
       - enough=False → message is the next question to ask.
@@ -91,6 +95,13 @@ async def interview_turn(transcript: list[dict]) -> dict:
     """
     answers_given = sum(1 for t in transcript if t["role"] == "user")
     force_wrap = answers_given >= MAX_INTERVIEW_ANSWERS
+
+    system_prompt = SYSTEM_PROMPT_INTERVIEW
+    if ui_lang == "ru":
+        system_prompt += (
+            "\n\nIMPORTANT: this user speaks Russian. Write EVERY message — "
+            "questions and the sign-off — in natural, native Russian."
+        )
 
     convo = _format_transcript(transcript)
     if force_wrap:
@@ -102,7 +113,7 @@ async def interview_turn(transcript: list[dict]) -> dict:
         instruction = "Give your next-turn JSON."
 
     result = await chat_json(
-        SYSTEM_PROMPT_INTERVIEW,
+        system_prompt,
         f"Conversation so far:\n\n{convo}\n\n{instruction}",
         model="smart",
     )
@@ -110,10 +121,10 @@ async def interview_turn(transcript: list[dict]) -> dict:
     # Robust fallbacks — never leave the user stuck mid-conversation.
     if not isinstance(result, dict) or not result.get("message"):
         logger.warning("Interview turn returned unusable result: %s", result)
-        return {
-            "enough": True,
-            "message": "Got it — that's enough to go on. Let me find your sources.",
-        }
+        fallback = ("Понял — этого достаточно. Иду искать ваши источники."
+                    if ui_lang == "ru"
+                    else "Got it — that's enough to go on. Let me find your sources.")
+        return {"enough": True, "message": fallback}
 
     enough = bool(result.get("enough")) or force_wrap
     return {"enough": enough, "message": str(result["message"]).strip()}

@@ -19,15 +19,21 @@ from telegram.ext import (
 import config
 from database import store
 from database.models import init_db, get_connection
+from bot.i18n import t
 from bot.messaging import send_rich_async
 from research.engine import run_research
 from research.feed_finder import find_news_pages
-from research.profile_builder import interview_turn, OPENER
+from research.profile_builder import interview_turn
 from crawler.fetcher import test_source
 from pipeline import usage
 from pipeline.news_cycle import run_news_cycle
 
 logger = logging.getLogger(__name__)
+
+
+def _lang(user_id: int) -> str:
+    """The user's interface language ('en' | 'ru')."""
+    return store.get_ui_lang(user_id)
 
 # ── Conversation state for /newstream ─────────────────────────────────────────
 # A single natural interview loop replaces the old fixed-form states.
@@ -61,35 +67,6 @@ def admin_only(handler):
 # COMMAND: /start
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_START_USER = """\
-# 🗞️ NewsStream Bot
-
-*Your personal news researcher.*
-
-Tell me what you want to stay on top of — in your own words — and I'll find \
-the best sources for it, watch them around the clock, and send you only the \
-stories that match.
-
-**Start with** `/newstream` — just describe your topic.
-
-## Your commands
-
-| Command | Description |
-|---------|-------------|
-| `/newstream` | Set up a news stream (just tell me what you want) |
-| `/streams` | List your streams |
-| `/sources <stream_id>` | See what a stream is watching |
-| `/addsource <stream_id> <url>` | Add a site you already like |
-| `/deletesource <source_id>` | Remove a source from your stream |
-| `/research <stream_id>` | Re-run source research for a stream |
-| `/latest` | Your latest fetched articles |
-| `/postsize <stream_id>` | Post length: standard / compact |
-| `/pausestream <stream_id>` | Pause a stream |
-| `/resumestream <stream_id>` | Resume a paused stream |
-| `/deletestream <stream_id>` | Delete a stream |
-| `/quiet <stream_id> 23-8` | No posts between those hours (`off` to clear) |\
-"""
-
 _START_ADMIN_EXTRA = """
 
 
@@ -108,9 +85,10 @@ You also bypass the per-user limits and can manage any user's stream by id.\
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Welcome message; admins additionally see the operator commands."""
-    text = _START_USER
-    if _is_admin(update.effective_user.id):
-        text += _START_ADMIN_EXTRA
+    user_id = update.effective_user.id
+    text = t(_lang(user_id), "start_user")
+    if _is_admin(user_id):
+        text += _START_ADMIN_EXTRA  # operator strings stay English by design
     await send_rich_async(update.effective_chat.id, text)
 
 
@@ -119,10 +97,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_newstream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start the natural intake conversation."""
-    context.user_data["transcript"] = [{"role": "assistant", "content": OPENER}]
+    """Start the natural intake conversation, in the user's interface language."""
+    opener = t(_lang(update.effective_user.id), "interview_opener")
+    context.user_data["transcript"] = [{"role": "assistant", "content": opener}]
 
-    await send_rich_async(update.effective_chat.id, OPENER)
+    await send_rich_async(update.effective_chat.id, opener)
     return INTERVIEW
 
 
@@ -137,7 +116,8 @@ async def handle_interview(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Show a genuine "typing…" indicator instead of mechanical status text.
     await context.bot.send_chat_action(update.effective_chat.id, "typing")
 
-    turn = await interview_turn(transcript)
+    turn = await interview_turn(transcript,
+                                ui_lang=_lang(update.effective_user.id))
     transcript.append({"role": "assistant", "content": turn["message"]})
 
     await send_rich_async(update.effective_chat.id, turn["message"])
@@ -168,20 +148,20 @@ def _research_allowed(user_id: int) -> tuple[bool, str]:
     if _is_admin(user_id):
         return True, ""
     if store.get_usage(user_id, "research_run") >= config.RESEARCH_RUNS_PER_DAY:
-        return False, (f"You've used your {config.RESEARCH_RUNS_PER_DAY} research "
-                       f"runs for today — try again tomorrow.")
+        return False, t(_lang(user_id), "limit_research",
+                        max=config.RESEARCH_RUNS_PER_DAY)
     return True, ""
 
 
 async def _start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Compile the conversation and kick off research."""
     user_id = update.effective_user.id
+    ui_lang = _lang(user_id)
     if not _is_admin(user_id) and \
             store.count_streams(user_id) >= config.MAX_STREAMS_PER_USER:
         await send_rich_async(
             update.effective_chat.id,
-            f"You already have {config.MAX_STREAMS_PER_USER} streams — that's the "
-            f"limit for now. `/deletestream <id>` frees a slot.")
+            t(ui_lang, "limit_streams", max=config.MAX_STREAMS_PER_USER))
         return ConversationHandler.END
     allowed, why = _research_allowed(user_id)
     if not allowed:
@@ -193,13 +173,19 @@ async def _start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Seed the stream name from the user's first answer; hand the full
     # conversation to the research engine as the criteria.
     first_answer = next(
-        (t["content"] for t in transcript if t["role"] == "user"), "New Stream"
+        (x["content"] for x in transcript if x["role"] == "user"), "New Stream"
     )
     convo_text = "\n".join(
-        f"{'User' if t['role'] == 'user' else 'Service'}: {t['content']}"
-        for t in transcript
+        f"{'User' if x['role'] == 'user' else 'Service'}: {x['content']}"
+        for x in transcript
     )
     answers = {"topic": first_answer, "conversation": convo_text}
+
+    # A non-English interface seeds the stream's POST language explicitly
+    # (predictable, announced below, overridable via /language <id>). English
+    # seeds nothing so the interview-inferred language still applies.
+    if ui_lang != "en":
+        answers["post_language"] = ui_lang
 
     is_first_stream = store.count_streams(user_id) == 0
 
@@ -218,12 +204,12 @@ async def _start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _notify_admin_new_user(update.effective_user, stream_name)
 
     chat_id = update.effective_chat.id
+    lang_note = (t(ui_lang, "research_kickoff_lang_note", stream_id=stream_id)
+                 if ui_lang == "ru" else "")
     await context.bot.send_message(
         chat_id,
-        "🔎 On it — I'm reading through the best sources on this now. This usually "
-        "takes a minute or two.\n\nWhile I work: how long should each post be? "
-        "(Standard by default — change anytime with /postsize.)",
-        reply_markup=_post_length_keyboard(stream_id),
+        t(ui_lang, "research_kickoff", lang_note=lang_note),
+        reply_markup=_post_length_keyboard(stream_id, ui_lang),
     )
 
     asyncio.create_task(_run_research_background(stream_id, answers, chat_id,
@@ -232,37 +218,94 @@ async def _start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ConversationHandler.END
 
 
-def _post_length_keyboard(stream_id: int) -> InlineKeyboardMarkup:
+def _post_length_keyboard(stream_id: int, lang: str = "en") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📄 Standard (~100 words)", callback_data=f"plen:{stream_id}:standard"),
-        InlineKeyboardButton("⚡ Compact", callback_data=f"plen:{stream_id}:compact"),
+        InlineKeyboardButton(t(lang, "btn_standard"),
+                             callback_data=f"plen:{stream_id}:standard"),
+        InlineKeyboardButton(t(lang, "btn_compact"),
+                             callback_data=f"plen:{stream_id}:compact"),
     ]])
 
 
 async def cmd_postsize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Set how long a stream's posts are."""
     chat_id = update.effective_chat.id
+    lang = _lang(update.effective_user.id)
     if not context.args:
         streams = store.get_streams_by_user(update.effective_user.id)
         if not streams:
-            await send_rich_async(chat_id, "You have no streams yet. Use `/newstream`.")
+            await send_rich_async(chat_id, t(lang, "no_streams_yet"))
             return
-        await send_rich_async(chat_id, "Usage: `/postsize <stream_id>` — I'll show the options.")
+        await send_rich_async(chat_id, t(lang, "postsize_usage"))
         return
     try:
         stream_id = int(context.args[0])
     except ValueError:
-        await send_rich_async(chat_id, "Invalid stream ID.")
+        await send_rich_async(chat_id, t(lang, "invalid_stream_id"))
         return
     owns, stream = await _owns_stream(update.effective_user.id, stream_id)
     if stream is None or not owns:
-        await send_rich_async(chat_id, "❌ That stream isn't yours.")
+        await send_rich_async(chat_id, t(lang, "not_your_stream"))
         return
     current = (stream.get("criteria") or {}).get("post_length", "standard")
     await context.bot.send_message(
         chat_id,
-        f"Posts for *{stream['name']}* are currently *{current}*. Pick a size:".replace("*", ""),
-        reply_markup=_post_length_keyboard(stream_id),
+        t(lang, "postsize_pick", name=stream["name"], current=current),
+        reply_markup=_post_length_keyboard(stream_id, lang),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMMAND: /language — interface language, or a stream's post language
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _ui_lang_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(t("en", "btn_lang_en"), callback_data="ulang:en"),
+        InlineKeyboardButton(t("en", "btn_lang_ru"), callback_data="ulang:ru"),
+    ]])
+
+
+def _stream_lang_keyboard(stream_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(t("en", "btn_lang_en"),
+                             callback_data=f"slang:{stream_id}:en"),
+        InlineKeyboardButton(t("en", "btn_lang_ru"),
+                             callback_data=f"slang:{stream_id}:ru"),
+    ]])
+
+
+async def cmd_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/language` → the bot's interface language for this user.
+    `/language <stream_id>` → the POST language of one stream."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    lang = _lang(user_id)
+
+    if not context.args:
+        await context.bot.send_message(
+            chat_id, t(lang, "lang_pick_ui"), reply_markup=_ui_lang_keyboard())
+        return
+
+    try:
+        stream_id = int(context.args[0])
+    except ValueError:
+        await send_rich_async(chat_id, t(lang, "invalid_stream_id"))
+        return
+    owns, stream = await _owns_stream(user_id, stream_id)
+    if stream is None or not owns:
+        await send_rich_async(chat_id, t(lang, "not_your_stream"))
+        return
+
+    criteria = stream.get("criteria") or {}
+    current_code = "ru" if (criteria.get("post_language")
+                            or criteria.get("language") or "").lower().startswith(
+                                ("ru", "рус")) else "en"
+    await context.bot.send_message(
+        chat_id,
+        t(lang, "lang_pick_stream", name=stream["name"],
+          current=t(lang, f"lang_name_{current_code}")),
+        reply_markup=_stream_lang_keyboard(stream_id),
     )
 
 
@@ -273,18 +316,18 @@ async def cmd_postsize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _owned_stream_from_args(update, context) -> tuple[int | None, dict | None]:
     """Parse `<stream_id>` from args and verify ownership. Replies on failure."""
     chat_id = update.effective_chat.id
+    lang = _lang(update.effective_user.id)
     if not context.args:
-        await send_rich_async(chat_id, "Usage: give me a stream id — "
-                                       "`/streams` lists yours.")
+        await send_rich_async(chat_id, t(lang, "lifecycle_usage"))
         return None, None
     try:
         stream_id = int(context.args[0])
     except ValueError:
-        await send_rich_async(chat_id, "Invalid stream ID.")
+        await send_rich_async(chat_id, t(lang, "invalid_stream_id"))
         return None, None
     owns, stream = await _owns_stream(update.effective_user.id, stream_id)
     if stream is None or not owns:
-        await send_rich_async(chat_id, "❌ That stream isn't yours.")
+        await send_rich_async(chat_id, t(lang, "not_your_stream"))
         return None, None
     return stream_id, stream
 
@@ -297,8 +340,8 @@ async def cmd_pausestream(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     store.update_stream_status(stream_id, "paused")
     await send_rich_async(
         update.effective_chat.id,
-        f"⏸️ **{stream['name']}** is paused — nothing will be posted and its "
-        f"sources stop being crawled. `/resumestream {stream_id}` brings it back.")
+        t(_lang(update.effective_user.id), "stream_paused",
+          name=stream["name"], stream_id=stream_id))
 
 
 async def cmd_resumestream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -310,7 +353,7 @@ async def cmd_resumestream(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     store.record_send_result(stream_id, ok=True)  # clear the auto-pause streak
     await send_rich_async(
         update.effective_chat.id,
-        f"▶️ **{stream['name']}** is active again. Sources resume on the next cycle.")
+        t(_lang(update.effective_user.id), "stream_resumed", name=stream["name"]))
 
 
 async def cmd_deletestream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -318,15 +361,16 @@ async def cmd_deletestream(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     stream_id, stream = await _owned_stream_from_args(update, context)
     if stream_id is None:
         return
+    lang = _lang(update.effective_user.id)
     n_sources = len(store.get_sources_by_stream(stream_id))
     await context.bot.send_message(
         update.effective_chat.id,
-        f"Delete \"{stream['name']}\" and its {n_sources} source "
-        f"subscription(s)? This can't be undone.",
+        t(lang, "delete_confirm", name=stream["name"], n=n_sources),
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🗑 Yes, delete it",
+            InlineKeyboardButton(t(lang, "btn_delete_yes"),
                                  callback_data=f"del_stream:{stream_id}"),
-            InlineKeyboardButton("✖️ Keep it", callback_data="del_stream:cancel"),
+            InlineKeyboardButton(t(lang, "btn_delete_keep"),
+                                 callback_data="del_stream:cancel"),
         ]]),
     )
 
@@ -334,11 +378,9 @@ async def cmd_deletestream(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def cmd_quiet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Set a stream's quiet hours: posts inside the window are held, not lost."""
     chat_id = update.effective_chat.id
+    lang = _lang(update.effective_user.id)
     if len(context.args) < 2:
-        await send_rich_async(
-            chat_id,
-            "Usage: `/quiet <stream_id> 23-8` — no posts from 23:00 to 08:00 "
-            "(server time). `/quiet <stream_id> off` clears it.")
+        await send_rich_async(chat_id, t(lang, "quiet_usage"))
         return
     stream_id, stream = await _owned_stream_from_args(update, context)
     if stream_id is None:
@@ -347,22 +389,19 @@ async def cmd_quiet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     spec = context.args[1].strip().lower()
     if spec in ("off", "none", "clear"):
         store.set_stream_criteria_field(stream_id, "quiet_hours", "")
-        await send_rich_async(chat_id, f"🔔 Quiet hours cleared for "
-                                       f"**{stream['name']}** — posts flow 24/7.")
+        await send_rich_async(chat_id, t(lang, "quiet_cleared", name=stream["name"]))
         return
 
     from pipeline.news_cycle import _parse_quiet_hours
     if _parse_quiet_hours({"quiet_hours": spec}) is None:
-        await send_rich_async(chat_id, "That doesn't parse — use e.g. `23-8` "
-                                       "(hours 0–23, start ≠ end).")
+        await send_rich_async(chat_id, t(lang, "quiet_bad_spec"))
         return
     store.set_stream_criteria_field(stream_id, "quiet_hours", spec)
     start, end = spec.split("-", 1)
     await send_rich_async(
         chat_id,
-        f"🔕 Quiet hours set for **{stream['name']}**: nothing between "
-        f"{int(start):02d}:00 and {int(end):02d}:00 (server time). Held posts "
-        f"go out on the first cycle after the window ends.")
+        t(lang, "quiet_set", name=stream["name"],
+          start=f"{int(start):02d}", end=f"{int(end):02d}"))
 
 
 async def _run_research_background(stream_id: int, answers: dict, chat_id: int,
@@ -372,6 +411,7 @@ async def _run_research_background(stream_id: int, answers: dict, chat_id: int,
     # Attribute every crawl/LLM call in this task to the requesting tenant.
     usage.set_user(user_id)
     store.increment_usage(user_id, "research_run")
+    lang = _lang(user_id)
     try:
         state = await run_research(answers, stream_id, progress=None)
 
@@ -385,6 +425,14 @@ async def _run_research_background(stream_id: int, answers: dict, chat_id: int,
                 profile["intake_conversation"] = (
                     answers.get("conversation") or ""
                 ) if isinstance(answers, dict) else ""
+            # USER PREFERENCES must survive re-research: they live in criteria,
+            # which this replaces. These keys are only ever user-set — the
+            # profile builder can't emit them, so nothing is clobbered.
+            old = (store.get_stream(stream_id) or {}).get("criteria") or {}
+            if isinstance(old, dict):
+                for pref in ("post_length", "quiet_hours", "post_language"):
+                    if old.get(pref) and not profile.get(pref):
+                        profile[pref] = old[pref]
             store.update_stream_criteria(stream_id, profile)
 
         store.update_stream_status(stream_id, "active")
@@ -409,10 +457,8 @@ async def _run_research_background(stream_id: int, answers: dict, chat_id: int,
             live = [s for s in active if item_counts.get(s["id"], 0) > 0]
             pending = [s for s in active if item_counts.get(s["id"], 0) == 0]
 
-            lines = [f"# ✅ Found {len(stored)} sources for you", "",
-                     f"Here's what I'll be watching for **{stream_name}**:", "",
-                     "| # | Source | Match | Articles | Status |",
-                     "|---|--------|-------|----------|--------|"]
+            lines = [t(lang, "res_header", n=len(stored), name=stream_name),
+                     t(lang, "res_table_header")]
             for i, src in enumerate(active + blocked, 1):
                 name = (src.get("name") or src["url"])[:25]
                 score = src.get("quality_score", 0)
@@ -425,44 +471,22 @@ async def _run_research_background(stream_id: int, answers: dict, chat_id: int,
                 lines.append(f"| {i} | {name} | {score}/100 | {n_items} | {icon} |")
 
             if live:
-                lines.append(f"\n{len(live)} source(s) are live and already "
-                             f"listing articles — I'll start pulling relevant "
-                             f"stories shortly.")
+                lines.append(t(lang, "res_live", n=len(live)))
             if pending:
-                lines.append(
-                    f"\n⏳ {len(pending)} listed no articles on the first read — "
-                    f"they stay on watch and count as live the moment they yield."
-                )
+                lines.append(t(lang, "res_pending", n=len(pending)))
             if blocked:
-                lines.append(
-                    f"\n🔄 {len(blocked)} were busy when I checked — I'll keep "
-                    f"retrying them automatically and they'll switch on once reachable."
-                )
+                lines.append(t(lang, "res_blocked", n=len(blocked)))
             if active and all((s.get("site_type") == "aggregator") for s in active):
-                lines.append(
-                    "\n⚠️ Everything live right now is an aggregator feed — "
-                    "I'd suggest `/addsource` with a publication you trust "
-                    "for first-party coverage."
-                )
-            lines.append(
-                f"\nWant to fine-tune? `/sources {stream_id}` shows the full list — "
-                f"drop any with `/deletesource <id>` or add your own with "
-                f"`/addsource {stream_id} <url>`."
-            )
+                lines.append(t(lang, "res_all_aggregators"))
+            lines.append(t(lang, "res_finetune", stream_id=stream_id))
             await send_rich_async(chat_id, "\n".join(lines))
         else:
-            await send_rich_async(chat_id, f"""\
-I dug through a lot of sites but couldn't find sources solid enough to trust for this one yet — often that means the topic is very narrow, or worth phrasing a little differently.
-
-A couple of options:
-• `/research {stream_id}` — I'll take another pass at it.
-• `/addsource {stream_id} <url>` — point me at a site you already like and I'll build from there.\
-""")
+            await send_rich_async(chat_id, t(lang, "res_none", stream_id=stream_id))
 
     except Exception as e:
         logger.exception("Background research failed")
         store.update_stream_status(stream_id, "active")
-        await send_rich_async(chat_id, f"❌ Research error: {e}")
+        await send_rich_async(chat_id, t(lang, "research_error", e=e))
 
 
 async def _reconcile_sources(sources: list[dict]) -> dict[int, int]:
@@ -496,7 +520,8 @@ async def _reconcile_sources(sources: list[dict]) -> dict[int, int]:
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel the conversation."""
-    await send_rich_async(update.effective_chat.id, "❌ Stream creation cancelled.")
+    await send_rich_async(update.effective_chat.id,
+                          t(_lang(update.effective_user.id), "cancelled"))
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -507,23 +532,25 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def cmd_streams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """List all streams."""
+    lang = _lang(update.effective_user.id)
     streams = store.get_streams_by_user(update.effective_user.id)
 
     if not streams:
-        await send_rich_async(update.effective_chat.id, "📭 You have no streams yet. Use `/newstream` to create one.")
+        await send_rich_async(update.effective_chat.id, t(lang, "streams_none"))
         return
 
-    markdown = "# 📋 Your News Streams\n\n"
-    markdown += "| ID | Name | Status | Sources |\n|----|------|--------|---------|\n"
+    markdown = t(lang, "streams_header")
 
     for s in streams:
         sources = store.get_sources_by_stream(s["id"])
         active = len([src for src in sources if src["fetch_status"] == "active"])
         name = s["name"][:30]
         status_emoji = {"active": "✅", "researching": "🔬", "paused": "⏸️"}.get(s["status"], "❓")
-        markdown += f"| {s['id']} | {name} | {status_emoji} {s['status']} | {active} |\n"
+        status_word = t(lang, f"status_{s['status']}") \
+            if s["status"] in ("active", "paused", "researching") else s["status"]
+        markdown += f"| {s['id']} | {name} | {status_emoji} {status_word} | {active} |\n"
 
-    markdown += "\nUse `/sources <id>` to view sources for a stream."
+    markdown += t(lang, "streams_footer")
 
     await send_rich_async(update.effective_chat.id, markdown)
 
@@ -534,30 +561,31 @@ async def cmd_streams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """View sources for a stream."""
+    lang = _lang(update.effective_user.id)
     if not context.args:
-        await send_rich_async(update.effective_chat.id, "Usage: `/sources <stream_id>`")
+        await send_rich_async(update.effective_chat.id, t(lang, "sources_usage"))
         return
 
     try:
         stream_id = int(context.args[0])
     except ValueError:
-        await send_rich_async(update.effective_chat.id, "Invalid stream ID. Usage: `/sources <stream_id>`")
+        await send_rich_async(update.effective_chat.id, t(lang, "invalid_stream_id"))
         return
 
     owns, stream = await _owns_stream(update.effective_user.id, stream_id)
     if stream is None or not owns:
-        await send_rich_async(update.effective_chat.id, "❌ That stream isn't yours.")
+        await send_rich_async(update.effective_chat.id, t(lang, "not_your_stream"))
         return
 
     sources = store.get_sources_by_stream(stream_id)
 
     if not sources:
-        await send_rich_async(update.effective_chat.id, f"📭 No sources found for stream `{stream_id}`.")
+        await send_rich_async(update.effective_chat.id,
+                              t(lang, "sources_none", stream_id=stream_id))
         return
 
     # The ID column IS the id you pass to /deletesource — never a row number.
-    markdown = f"# 📰 Sources for Stream `{stream_id}`\n\n"
-    markdown += "| ID | Source | Score | Status |\n|----|--------|-------|--------|\n"
+    markdown = t(lang, "sources_header", stream_id=stream_id)
 
     for src in sources:
         name = (src.get("name") or src["url"])[:28]
@@ -565,26 +593,30 @@ async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         status_icon = {"active": "✅", "blocked": "🚫", "error": "⚠️"}.get(src["fetch_status"], "❓")
         markdown += f"| `{src['id']}` | [{name}]({src['url']}) | {score} | {status_icon} |\n"
 
-    detail_parts = ["\n---\n## Details\n"]
+    detail_parts = [t(lang, "sources_details")]
     for src in sources:
-        type_label = {"news_site": "📰 News site", "company_blog": "🏢 Company blog",
-                      "aggregator": "🔗 Aggregator", "analysis": "🔬 Analysis"}.get(
-                          src.get("site_type"), "")
+        site_type = src.get("site_type")
+        type_label = (t(lang, f"type_{site_type}")
+                      if site_type in ("news_site", "company_blog",
+                                       "aggregator", "analysis") else "")
         header = f"\n**`{src['id']}` — {src.get('name') or src['url']}**"
         if type_label:
             header += f"  · {type_label}"
         detail_parts.append(header)
-        detail_parts.append(f"- Site: {src['url']}")
+        detail_parts.append(t(lang, "sources_site", url=src["url"]))
         if src.get("feed_url") and src["feed_url"] != src["url"]:
-            detail_parts.append(f"- Polling: {src['feed_url']}")
-        detail_parts.append(f"- Score: {src.get('quality_score', 0)}/100 · Status: {src['fetch_status']}")
+            detail_parts.append(t(lang, "sources_polling", url=src["feed_url"]))
+        detail_parts.append(t(lang, "sources_score_status",
+                              score=src.get("quality_score", 0),
+                              status=src["fetch_status"]))
         if src.get("specific_keywords"):
-            detail_parts.append(f"- Keywords: {', '.join(src['specific_keywords'])}")
+            detail_parts.append(t(lang, "sources_keywords",
+                                  kw=", ".join(src["specific_keywords"])))
         if src.get("description"):
             detail_parts.append(f"- {src['description']}")
 
     markdown += "\n".join(detail_parts)
-    markdown += "\n\n_Delete with_ `/deletesource <ID>` _— or tap below._"
+    markdown += t(lang, "sources_delete_hint")
 
     await send_rich_async(update.effective_chat.id, markdown)
 
@@ -592,7 +624,7 @@ async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🗑 {src['id']} · {_short(src.get('name') or src['url'], 26)}",
         callback_data=f"del_src:{src['id']}")] for src in sources[:10]]
     await context.bot.send_message(
-        update.effective_chat.id, "Tap a source to delete it:",
+        update.effective_chat.id, t(lang, "sources_tap_delete"),
         reply_markup=InlineKeyboardMarkup(rows),
     )
 
@@ -645,48 +677,43 @@ async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     the page that actually lists its articles rather than polling a homepage.
     """
     chat_id = update.effective_chat.id
+    lang = _lang(update.effective_user.id)
 
     if len(context.args) < 2:
-        await send_rich_async(chat_id, "Usage: `/addsource <stream_id> <url>`")
+        await send_rich_async(chat_id, t(lang, "addsource_usage"))
         return
 
     try:
         stream_id = int(context.args[0])
     except ValueError:
-        await send_rich_async(chat_id, "Invalid stream ID.")
+        await send_rich_async(chat_id, t(lang, "invalid_stream_id"))
         return
 
     owns, stream = await _owns_stream(update.effective_user.id, stream_id)
     if stream is None:
-        await send_rich_async(chat_id, f"❌ Stream `{stream_id}` not found.")
+        await send_rich_async(chat_id, t(lang, "stream_not_found", stream_id=stream_id))
         return
     if not owns:
-        await send_rich_async(chat_id, "❌ That stream isn't yours.")
+        await send_rich_async(chat_id, t(lang, "not_your_stream"))
         return
 
     if not _is_admin(update.effective_user.id) and \
             len(store.get_sources_by_stream(stream_id)) >= config.MAX_SOURCES_PER_STREAM:
         await send_rich_async(
-            chat_id,
-            f"This stream already follows {config.MAX_SOURCES_PER_STREAM} sources "
-            f"— that's the cap. Drop one with `/deletesource <id>` first.")
+            chat_id, t(lang, "limit_sources", max=config.MAX_SOURCES_PER_STREAM))
         return
 
     url = context.args[1]
     if "://" not in url:
         url = f"https://{url}"
 
-    await send_rich_async(
-        chat_id,
-        f"🔍 Looking for the news page on `{url}`...\n\n_Checking for feeds, "
-        f"section pages, and site navigation. This takes a moment._",
-    )
+    await send_rich_async(chat_id, t(lang, "addsource_looking", url=url))
 
     try:
         candidates = await find_news_pages(url)
     except Exception as e:
         logger.exception("Feed discovery failed for %s", url)
-        await send_rich_async(chat_id, f"❌ Couldn't inspect that site: {e}")
+        await send_rich_async(chat_id, t(lang, "addsource_inspect_error", e=e))
         return
 
     # ── Nothing publishable ───────────────────────────────────────────
@@ -694,21 +721,21 @@ async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         context.user_data["pending_source"] = {"stream_id": stream_id, "url": url}
         await context.bot.send_message(
             chat_id,
-            f"I crawled <b>{url}</b> — its feeds, common news paths, and its own "
-            f"navigation — and couldn't find any page that lists articles.\n\n"
-            f"That usually means the site doesn't publish a news feed, or it "
-            f"blocks crawlers.\n\nAdd it anyway and poll the URL as given?",
+            t(lang, "addsource_none_found", url=url),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("➕ Add anyway", callback_data="feed:force"),
-                InlineKeyboardButton("✖️ Cancel", callback_data="feed:cancel"),
+                InlineKeyboardButton(t(lang, "btn_add_anyway"),
+                                     callback_data="feed:force"),
+                InlineKeyboardButton(t(lang, "btn_cancel"),
+                                     callback_data="feed:cancel"),
             ]]),
         )
         return
 
     # ── Exactly one → just add it ─────────────────────────────────────
     if len(candidates) == 1:
-        await _store_discovered_source(chat_id, stream_id, url, candidates[0])
+        await _store_discovered_source(chat_id, stream_id, url, candidates[0],
+                                       lang=lang)
         return
 
     # ── Several → let the user choose ─────────────────────────────────
@@ -717,14 +744,16 @@ async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "cands": [(c.url, c.kind, c.item_count, c.scope) for c in candidates],
     }
     rows = [[InlineKeyboardButton(
-        f"{'📡' if c.kind == 'feed' else '📄'} {_short(c.url)} · {c.item_count} articles",
+        t(lang, "btn_feed_option",
+          icon="📡" if c.kind == "feed" else "📄",
+          url=_short(c.url), n=c.item_count),
         callback_data=f"feed:{i}")] for i, c in enumerate(candidates)]
-    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="feed:cancel")])
+    rows.append([InlineKeyboardButton(t(lang, "btn_cancel"),
+                                      callback_data="feed:cancel")])
 
     await context.bot.send_message(
         chat_id,
-        f"<b>{url}</b> has more than one page that publishes articles.\n\n"
-        f"Which should I follow?",
+        t(lang, "addsource_multi", url=url),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(rows),
     )
@@ -736,21 +765,21 @@ def _short(url: str, n: int = 34) -> str:
 
 
 async def _store_discovered_source(chat_id: int, stream_id: int, site_url: str,
-                                   cand) -> None:
+                                   cand, lang: str = "en") -> None:
     """Persist a verified news page as a source, keyed on the site's root URL."""
     if store.get_source_by_url(stream_id, site_url):
-        await send_rich_async(chat_id, "⚠️ That source is already on this stream.")
+        await send_rich_async(chat_id, t(lang, "source_dup"))
         return
 
     name = (cand.title or _short(site_url, 60))[:100]
     if cand.kind == "feed":
-        method, kind = "rss", "RSS feed"
+        method, kind_key = "rss", "kind_feed"
     elif getattr(cand, "scope", "internal") == "external":
         # Outbound aggregator: the page's headlines link to other domains, so
         # the poller must keep off-domain links for this source.
-        method, kind = "links_ext", "page linking out to articles"
+        method, kind_key = "links_ext", "kind_page_ext"
     else:
-        method, kind = "links", "article page"
+        method, kind_key = "links", "kind_page"
     source_id = store.add_source(
         stream_id=stream_id, url=site_url, name=name,
         feed_url=cand.url, fetch_status="active",
@@ -764,23 +793,17 @@ async def _store_discovered_source(chat_id: int, stream_id: int, site_url: str,
     except Exception:
         logger.exception("Embedding a manually-added source failed (non-fatal)")
 
-    await send_rich_async(chat_id, f"""\
-✅ **Source added** — `{source_id}`
-
-**Site:** {site_url}
-**Polling:** {cand.url}
-_Found via {kind} — {cand.item_count} articles detected._
-
-I'll baseline it on the next cycle: everything published so far is recorded \
-silently, and you'll only hear about what appears *after* that.\
-""")
+    await send_rich_async(chat_id, t(
+        lang, "source_added", source_id=source_id, site=site_url,
+        poll=cand.url, kind=t(lang, kind_key), n=cand.item_count))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COMMAND: /deletesource <source_id>
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _delete_source_for(user_id: int, source_id: int) -> tuple[bool, str]:
+async def _delete_source_for(user_id: int, source_id: int,
+                             lang: str = "en") -> tuple[bool, str]:
     """
     Remove a source from the caller's stream(s). Sources are canonical now —
     "deleting" unsubscribes THIS user's streams; the row itself only goes away
@@ -788,9 +811,7 @@ async def _delete_source_for(user_id: int, source_id: int) -> tuple[bool, str]:
     """
     src = store.get_source(source_id)
     if not src:
-        return False, (f"❌ No source with ID `{source_id}`.\n\n"
-                       f"Use `/sources <stream_id>` — the **ID** column is what "
-                       f"you pass here, not the row position.")
+        return False, t(lang, "source_not_found", source_id=source_id)
 
     # Which of the caller's streams actually follow it?
     subscribed = [
@@ -798,28 +819,31 @@ async def _delete_source_for(user_id: int, source_id: int) -> tuple[bool, str]:
         if any(x["id"] == source_id for x in store.get_sources_by_stream(s["id"]))
     ]
     if not subscribed:
-        return False, "❌ That source isn't on any of your streams."
+        return False, t(lang, "source_not_on_streams")
 
     for sid in subscribed:
         store.unsubscribe(sid, source_id)
     name = src.get("name") or src["url"]
-    return True, f"🗑️ Removed source `{source_id}` — {name}"
+    return True, t(lang, "source_removed", source_id=source_id, name=name)
 
 
 async def cmd_deletesource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Delete a source by its database ID."""
+    lang = _lang(update.effective_user.id)
     if not context.args:
         await send_rich_async(update.effective_chat.id,
-                              "Usage: `/deletesource <source_id>`")
+                              t(lang, "deletesource_usage"))
         return
 
     try:
         source_id = int(context.args[0])
     except ValueError:
-        await send_rich_async(update.effective_chat.id, "Invalid source ID.")
+        await send_rich_async(update.effective_chat.id,
+                              t(lang, "invalid_source_id"))
         return
 
-    _, msg = await _delete_source_for(update.effective_user.id, source_id)
+    _, msg = await _delete_source_for(update.effective_user.id, source_id,
+                                      lang=lang)
     await send_rich_async(update.effective_chat.id, msg)
 
 
@@ -835,13 +859,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data or ""
     user_id = query.from_user.id
     chat_id = query.message.chat_id
+    lang = _lang(user_id)
+
+    # ── Interface language ────────────────────────────────────────────
+    if data.startswith("ulang:"):
+        choice = data.split(":", 1)[1]
+        if choice in ("en", "ru"):
+            store.set_ui_lang(user_id, choice)
+            # Confirm in the language they just chose, not the old one.
+            await query.edit_message_text(t(choice, "lang_ui_set"))
+        return
+
+    # ── A stream's post language ──────────────────────────────────────
+    if data.startswith("slang:"):
+        _, sid, choice = data.split(":", 2)
+        owns, stream = await _owns_stream(user_id, int(sid))
+        if stream is None or not owns:
+            await query.edit_message_text(t(lang, "not_your_stream"))
+            return
+        if choice in ("en", "ru"):
+            store.set_stream_criteria_field(int(sid), "post_language", choice)
+            await query.edit_message_text(
+                t(lang, "lang_stream_set", name=stream["name"],
+                  language=t(lang, f"lang_name_{choice}")))
+        return
 
     # ── Delete a source ───────────────────────────────────────────────
     if data.startswith("del_src:"):
         source_id = int(data.split(":", 1)[1])
-        ok, msg = await _delete_source_for(user_id, source_id)
+        ok, msg = await _delete_source_for(user_id, source_id, lang=lang)
         await query.edit_message_text(
-            ("🗑️ Deleted." if ok else "Couldn't delete that one."))
+            t(lang, "deleted_short") if ok else t(lang, "delete_failed_short"))
         await send_rich_async(chat_id, msg)
         return
 
@@ -849,16 +897,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data.startswith("del_stream:"):
         arg = data.split(":", 1)[1]
         if arg == "cancel":
-            await query.edit_message_text("Kept — nothing was deleted.")
+            await query.edit_message_text(t(lang, "kept_nothing_deleted"))
             return
         stream_id = int(arg)
         owns, stream = await _owns_stream(user_id, stream_id)
         if stream is None or not owns:
-            await query.edit_message_text("That stream isn't yours.")
+            await query.edit_message_text(t(lang, "not_your_stream"))
             return
         store.delete_stream(stream_id)
-        await query.edit_message_text(f"🗑 Deleted \"{stream['name']}\" and "
-                                      f"unsubscribed its sources.")
+        await query.edit_message_text(t(lang, "stream_deleted", name=stream["name"]))
         return
 
     # ── 👍/👎 feedback on a delivered post (§3.7) ─────────────────────
@@ -885,11 +932,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         _, sid, length = data.split(":", 2)
         owns, _stream = await _owns_stream(user_id, int(sid))
         if not owns:
-            await query.edit_message_text("That stream isn't yours.")
+            await query.edit_message_text(t(lang, "not_your_stream"))
             return
         store.set_post_length(int(sid), length)
-        pretty = "Standard (~100 words)" if length == "standard" else "Compact"
-        await query.edit_message_text(f"✅ Posts set to {pretty}.")
+        key = "plen_set_standard" if length == "standard" else "plen_set_compact"
+        await query.edit_message_text(t(lang, key))
         return
 
     # ── Re-test a source ──────────────────────────────────────────────
@@ -914,40 +961,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "feed:cancel":
         context.user_data.pop("feed_candidates", None)
         context.user_data.pop("pending_source", None)
-        await query.edit_message_text("Cancelled — nothing was added.")
+        await query.edit_message_text(t(lang, "cancelled_nothing_added"))
         return
 
     if data == "feed:force":
         pending = context.user_data.pop("pending_source", None)
         if not pending:
-            await query.edit_message_text("That request expired. Run /addsource again.")
+            await query.edit_message_text(t(lang, "choice_expired"))
             return
         # Telegram can redeliver a callback on lag — don't add the source twice.
         if store.get_source_by_url(pending["stream_id"], pending["url"]):
-            await query.edit_message_text("That source is already on this stream.")
+            await query.edit_message_text(t(lang, "source_dup"))
             return
         source_id = store.add_source(
             stream_id=pending["stream_id"], url=pending["url"],
             name=_short(pending["url"], 60), feed_url=pending["url"],
             fetch_status="active",
         )
-        await query.edit_message_text("Added as-is.")
-        await send_rich_async(chat_id, f"""\
-➕ **Added anyway** — `{source_id}`
-
-I'll poll {pending['url']} directly. If it never yields articles it will be \
-marked as errored after a few cycles.\
-""")
+        await query.edit_message_text(t(lang, "added_as_is"))
+        await send_rich_async(chat_id, t(lang, "added_anyway",
+                                         source_id=source_id,
+                                         url=pending["url"]))
         return
 
     if data.startswith("feed:"):
         picked = context.user_data.get("feed_candidates")
         if not picked:
-            await query.edit_message_text("That choice expired. Run /addsource again.")
+            await query.edit_message_text(t(lang, "choice_expired"))
             return
         idx = int(data.split(":", 1)[1])
         if idx >= len(picked["cands"]):
-            await query.edit_message_text("That option is no longer valid.")
+            await query.edit_message_text(t(lang, "option_invalid"))
             return
 
         chosen = picked["cands"][idx]
@@ -956,9 +1000,9 @@ marked as errored after a few cycles.\
         from types import SimpleNamespace
         cand = SimpleNamespace(url=url, kind=kind, item_count=count, title="",
                                scope=scope)
-        await query.edit_message_text(f"Following {_short(url, 48)}.")
+        await query.edit_message_text(t(lang, "following_page", url=_short(url, 48)))
         await _store_discovered_source(chat_id, picked["stream_id"],
-                                       picked["site_url"], cand)
+                                       picked["site_url"], cand, lang=lang)
         context.user_data.pop("feed_candidates", None)
         return
 
@@ -1006,19 +1050,20 @@ async def cmd_testsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Re-run research for a stream."""
+    lang = _lang(update.effective_user.id)
     if not context.args:
-        await send_rich_async(update.effective_chat.id, "Usage: `/research <stream_id>`")
+        await send_rich_async(update.effective_chat.id, t(lang, "research_usage"))
         return
 
     try:
         stream_id = int(context.args[0])
     except ValueError:
-        await send_rich_async(update.effective_chat.id, "Invalid stream ID.")
+        await send_rich_async(update.effective_chat.id, t(lang, "invalid_stream_id"))
         return
 
     owns, stream = await _owns_stream(update.effective_user.id, stream_id)
     if stream is None or not owns:
-        await send_rich_async(update.effective_chat.id, "❌ That stream isn't yours.")
+        await send_rich_async(update.effective_chat.id, t(lang, "not_your_stream"))
         return
 
     allowed, why = _research_allowed(update.effective_user.id)
@@ -1027,7 +1072,8 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     store.update_stream_status(stream_id, "researching")
-    await send_rich_async(update.effective_chat.id, f"🔬 Re-running research for stream `{stream_id}`...")
+    await send_rich_async(update.effective_chat.id,
+                          t(lang, "research_rerun", stream_id=stream_id))
 
     chat_id = update.effective_chat.id
 
@@ -1048,7 +1094,7 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         stream_id, answers, chat_id, context,
         user_id=update.effective_user.id))
 
-    await send_rich_async(update.effective_chat.id, "Research started in background. I'll update you with results.")
+    await send_rich_async(update.effective_chat.id, t(lang, "research_started"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1057,14 +1103,14 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the caller's latest fetched articles (their streams only)."""
+    lang = _lang(update.effective_user.id)
     articles = store.get_latest_articles_for_user(update.effective_user.id, limit=15)
 
     if not articles:
-        await send_rich_async(update.effective_chat.id, "📭 No articles fetched yet.")
+        await send_rich_async(update.effective_chat.id, t(lang, "latest_none"))
         return
 
-    markdown = "# 📰 Latest Articles\n\n"
-    markdown += "| # | Title | Source | Relevance |\n|---|-------|--------|----------|\n"
+    markdown = t(lang, "latest_header")
 
     for i, art in enumerate(articles, 1):
         title = (art.get("title") or "Untitled")[:40]

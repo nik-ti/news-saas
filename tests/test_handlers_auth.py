@@ -118,7 +118,7 @@ async def test_non_admin_still_rejected_from_others_streams(temp_db, monkeypatch
     assert "isn't yours" in sent[0][1]
 
 
-async def test_admin_exempt_from_research_limit(monkeypatch):
+async def test_admin_exempt_from_research_limit(temp_db, monkeypatch):
     monkeypatch.setattr(config, "ADMIN_USER_ID", 111)
     monkeypatch.setattr(handlers.store, "get_usage", lambda uid, kind: 999)
 
@@ -128,7 +128,7 @@ async def test_admin_exempt_from_research_limit(monkeypatch):
     assert ok_user is False and "research" in why
 
 
-async def test_start_shows_operator_commands_only_to_admin(monkeypatch):
+async def test_start_shows_operator_commands_only_to_admin(temp_db, monkeypatch):
     monkeypatch.setattr(config, "ADMIN_USER_ID", 111)
     sent = _capture_sends(monkeypatch)
 
