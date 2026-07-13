@@ -18,7 +18,7 @@ forever.
 """
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import config
 from bot.messaging import send_html_message_async, send_rich_async
@@ -26,7 +26,7 @@ from database import store
 from pipeline.fetch_news import snapshot_source, SourceFetchError, UNCHANGED
 from pipeline.post_writer import write_post
 from pipeline.relevance_checker import check_relevance
-from pipeline.summarize import summarize_article, SKIP
+from pipeline.summarize import summarize_article, SKIP, STALE
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +189,23 @@ async def _baseline_and_fetch_phase() -> tuple[int, int]:
             )
             continue
 
-        to_queue = fresh[:config.MAX_NEW_PER_SOURCE]
+        # Age guard: "new to us" is not "news". An item whose known publication
+        # date (feed pubDate / URL date) is past the cutoff — a resurfaced old
+        # link, a stale Google News result, a reactivated source's backlog —
+        # is recorded so it's never re-examined, but never delivered.
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(days=config.MAX_ARTICLE_AGE_DAYS))
+        deliverable, stale = [], []
+        for item in fresh:
+            ts = item.get("published_at")
+            (stale if ts and ts < cutoff else deliverable).append(item)
+        if stale:
+            store.add_articles_batch(source_id, stale)
+            _mark_seen({i["content_hash"] for i in stale})
+            logger.info("Source %s: %d stale item(s) recorded, not delivered",
+                        source["url"], len(stale))
+
+        to_queue = deliverable[:config.MAX_NEW_PER_SOURCE]
         article_ids = store.add_articles_batch(source_id, to_queue)
 
         # Fan out: one delivery per subscribed ACTIVE stream, unless that
@@ -206,9 +222,9 @@ async def _baseline_and_fetch_phase() -> tuple[int, int]:
 
         # Anything beyond the per-source cap is left undiscovered; it will be
         # picked up next cycle (it stays absent from the dedup set).
-        if len(fresh) > config.MAX_NEW_PER_SOURCE:
+        if len(deliverable) > config.MAX_NEW_PER_SOURCE:
             logger.info("Source %s: %d new, capped to %d this cycle",
-                        source["url"], len(fresh), config.MAX_NEW_PER_SOURCE)
+                        source["url"], len(deliverable), config.MAX_NEW_PER_SOURCE)
 
     return baselined, queued
 
@@ -337,7 +353,7 @@ async def _post_phase() -> dict:
         global_limit=config.MAX_POSTS_PER_CYCLE,
     )
     stats = {"candidates": len(queue), "posted": 0, "irrelevant": 0,
-             "duplicate": 0, "dropped": 0, "retry": 0, "held": 0}
+             "duplicate": 0, "dropped": 0, "retry": 0, "held": 0, "stale": 0}
     if not queue:
         return stats
 
@@ -365,6 +381,12 @@ async def _post_phase() -> dict:
                 logger.info("Article %d not a usable news page — dropped", article_id)
                 store.update_delivery_status(article_id, stream_id, "unusable")
                 stats["dropped"] += 1
+                continue
+            if summary == STALE:
+                logger.info("Article %d is old news per its own dateline — "
+                            "not delivered", article_id)
+                store.update_delivery_status(article_id, stream_id, "stale")
+                stats["stale"] += 1
                 continue
 
             # Persist the summary: a retry (LLM outage, Telegram 5xx) then costs

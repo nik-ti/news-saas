@@ -94,6 +94,9 @@ class Candidate:
     kind: str          # "feed" | "page"
     item_count: int    # articles/entries actually found
     title: str = ""
+    scope: str = "internal"   # "internal" | "external" — where its article
+                              # links point. External = an outbound aggregator
+                              # page whose headlines link to other domains.
 
     @property
     def label(self) -> str:
@@ -242,13 +245,23 @@ async def _score_feed(url: str) -> Candidate | None:
 
 
 def _score_crawled(page: dict, url: str) -> Candidate | None:
-    """Does this already-crawled page expose enough articles to be worth polling?"""
+    """Does this already-crawled page expose enough articles to be worth polling?
+
+    Same-domain links first (the normal publication case). A page that fails
+    that bar but is rich in OFF-domain headlines is an outbound aggregator
+    (futuretools.io/news links out to TechCrunch etc.) — a perfectly good
+    source that the internal-only filter used to reject outright.
+    """
     if not page["success"]:
         return None
     links = article_links_on_page(page, url)
     if len(links) >= MIN_ARTICLE_LINKS:
         return Candidate(url=url, kind="page", item_count=len(links),
                          title=page.get("title") or "")
+    ext_links = article_links_on_page(page, url, external=True)
+    if len(ext_links) >= MIN_ARTICLE_LINKS:
+        return Candidate(url=url, kind="page", item_count=len(ext_links),
+                         title=page.get("title") or "", scope="external")
     return None
 
 
@@ -375,6 +388,13 @@ async def find_news_pages(site_url: str, max_candidates: int = 5) -> list[Candid
     pages = await _verify_pages(to_verify, home, root)
 
     pages.sort(key=lambda c: (c.item_count, -len(path_segments(c.url))), reverse=True)
+
+    # The page the user explicitly gave beats any score, as long as it proved
+    # itself. They said "poll THIS page" — honour it. (Stable sort: everything
+    # else keeps its score order behind it.)
+    given_key = normalise_url(site_url)
+    pages.sort(key=lambda c: normalise_url(c.url) != given_key)
+
     logger.info("feed_finder: %d verified page(s)", len(pages))
     return pages[:max_candidates]
 

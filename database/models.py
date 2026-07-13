@@ -88,7 +88,7 @@ CREATE TABLE IF NOT EXISTS deliveries (
     article_id  INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
     stream_id   INTEGER NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
     status      TEXT DEFAULT 'new',  -- new | posted | irrelevant | dropped |
-                                     -- unusable | send_failed | duplicate
+                                     -- unusable | send_failed | duplicate | stale
     post_html   TEXT,                -- the exact post that was sent (provenance)
     verdict     TEXT,                -- user feedback: up | down
     posted_at   TEXT,

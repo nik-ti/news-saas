@@ -665,7 +665,7 @@ async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # ── Several → let the user choose ─────────────────────────────────
     context.user_data["feed_candidates"] = {
         "stream_id": stream_id, "site_url": url,
-        "cands": [(c.url, c.kind, c.item_count) for c in candidates],
+        "cands": [(c.url, c.kind, c.item_count, c.scope) for c in candidates],
     }
     rows = [[InlineKeyboardButton(
         f"{'📡' if c.kind == 'feed' else '📄'} {_short(c.url)} · {c.item_count} articles",
@@ -694,12 +694,19 @@ async def _store_discovered_source(chat_id: int, stream_id: int, site_url: str,
         return
 
     name = (cand.title or _short(site_url, 60))[:100]
+    if cand.kind == "feed":
+        method, kind = "rss", "RSS feed"
+    elif getattr(cand, "scope", "internal") == "external":
+        # Outbound aggregator: the page's headlines link to other domains, so
+        # the poller must keep off-domain links for this source.
+        method, kind = "links_ext", "page linking out to articles"
+    else:
+        method, kind = "links", "article page"
     source_id = store.add_source(
         stream_id=stream_id, url=site_url, name=name,
         feed_url=cand.url, fetch_status="active",
-        fetch_method="rss" if cand.kind == "feed" else "links",
+        fetch_method=method,
     )
-    kind = "RSS feed" if cand.kind == "feed" else "article page"
 
     # Add it to the semantic internal DB too (best-effort).
     try:
@@ -894,9 +901,12 @@ marked as errored after a few cycles.\
             await query.edit_message_text("That option is no longer valid.")
             return
 
-        url, kind, count = picked["cands"][idx]
+        chosen = picked["cands"][idx]
+        url, kind, count = chosen[0], chosen[1], chosen[2]
+        scope = chosen[3] if len(chosen) > 3 else "internal"
         from types import SimpleNamespace
-        cand = SimpleNamespace(url=url, kind=kind, item_count=count, title="")
+        cand = SimpleNamespace(url=url, kind=kind, item_count=count, title="",
+                               scope=scope)
         await query.edit_message_text(f"Following {_short(url, 48)}.")
         await _store_discovered_source(chat_id, picked["stream_id"],
                                        picked["site_url"], cand)

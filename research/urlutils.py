@@ -6,7 +6,9 @@ but a *source* must be a site or section that keeps publishing. These helpers
 deterministically collapse article URLs to their section root and detect
 article-like URLs so they never end up stored as sources or feed_urls.
 """
+import calendar
 import re
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 # Path segments that indicate an article LIST page (good feed candidates)
@@ -22,6 +24,40 @@ INDEX_SEGMENTS = {"index", "archive", "archives", "all", "page", "home"}
 
 _DATE_PATTERN = re.compile(r"/(19|20)\d{2}([/-]\d{1,2})?([/-]\d{1,2})?(/|$)")
 _NUMERIC_ID_PATTERN = re.compile(r"/\d{4,}(/|$)")
+
+# A full Y-M-D datestamp may sit right against a slug (/2026-07-10-story) —
+# three date parts in a row are unambiguous. A bare year or year-month is NOT:
+# "/2008-financial-crisis-lessons" is a topic, not a dateline, so partial dates
+# must end cleanly at a path boundary.
+_FULL_DATE_CAPTURE = re.compile(
+    r"/((?:19|20)\d{2})[/-](\d{1,2})[/-](\d{1,2})(?=[/-]|$)")
+_PARTIAL_DATE_CAPTURE = re.compile(
+    r"/((?:19|20)\d{2})(?:[/-](\d{1,2}))?(?=/|$)")
+
+
+def date_from_url(url: str) -> datetime | None:
+    """
+    Publication date implied by a URL's path (/2024/03/15/story, /news/2023-05-02-x).
+    Partial dates resolve to their LATEST possible moment (end of month / Dec 31)
+    so only clearly-old articles are ever judged stale from a URL alone.
+    Returns None when the path carries no date — absence of a date proves nothing.
+    """
+    path = urlparse(url).path
+    try:
+        m = _FULL_DATE_CAPTURE.search(path)
+        if m:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                            tzinfo=timezone.utc)
+        m = _PARTIAL_DATE_CAPTURE.search(path)
+        if not m:
+            return None
+        year, month = int(m.group(1)), m.group(2)
+        if month:
+            last = calendar.monthrange(year, int(month))[1]
+            return datetime(year, int(month), last, 23, 59, tzinfo=timezone.utc)
+        return datetime(year, 12, 31, 23, 59, tzinfo=timezone.utc)
+    except ValueError:
+        return None  # "/2024/99/" — a number that isn't really a date
 
 
 def registered_domain(url: str) -> str:

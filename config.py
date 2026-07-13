@@ -67,6 +67,11 @@ MAX_SOURCES_PER_STREAM = 15
 # the Stage-1 prefilter and goes straight to deep qualification.
 CACHE_SKIP_STAGE1_SIMILARITY = 0.75
 
+# Article age guard: an item whose publication date (feed pubDate, URL date, or
+# the date visible on the article page) is older than this is recorded so it's
+# never re-examined, but NEVER delivered — "new to us" is not "news".
+MAX_ARTICLE_AGE_DAYS = 7
+
 # Re-baseline guard: if a KNOWN source suddenly shows this many "new" items and
 # they make up at least this fraction of its page, the page structure changed
 # (redesign, URL scheme change) — re-baseline silently instead of posting stale

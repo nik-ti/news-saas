@@ -326,10 +326,16 @@ async def _repair_feed_url(src: dict) -> dict:
         return src
 
     if candidates:
+        best = candidates[0]
         logger.info("Repaired feed_url for %s: %s → %s",
-                    src["url"], feed_url, candidates[0].url)
-        src["feed_url"] = candidates[0].url
-        src["fetch_method"] = "rss" if candidates[0].kind == "feed" else "links"
+                    src["url"], feed_url, best.url)
+        src["feed_url"] = best.url
+        if best.kind == "feed":
+            src["fetch_method"] = "rss"
+        elif getattr(best, "scope", "internal") == "external":
+            src["fetch_method"] = "links_ext"
+        else:
+            src["fetch_method"] = "links"
         src["_feed_verified"] = True
     return src
 
