@@ -24,7 +24,7 @@ from bot.i18n import t
 from bot.messaging import send_rich_async
 from research.engine import run_research
 from research.feed_finder import find_news_pages
-from research.profile_builder import interview_turn
+from research.profile_builder import interview_turn, generate_stream_name
 from crawler.fetcher import test_source
 from pipeline import usage
 from pipeline.news_cycle import run_news_cycle
@@ -144,13 +144,25 @@ _STATUS_ICONS = {"active": "✅", "paused": "⏸", "researching": "🔬"}
 
 
 def _screen_streams(user_id: int, lang: str) -> tuple[str, InlineKeyboardMarkup]:
-    streams = store.get_streams_by_user(user_id)
-    rows = [[_btn(f"{_STATUS_ICONS.get(s['status'], '❓')} {s['name'][:40]}",
-                  f"menu:stream:{s['id']}")] for s in streams[:20]]
+    # The operator sees every user's streams (each tagged with the owner id);
+    # everyone else sees only their own.
+    admin = _is_admin(user_id)
+    streams = store.get_all_streams() if admin else store.get_streams_by_user(user_id)
+    rows = []
+    for s in streams[:30 if admin else 20]:
+        label = f"{_STATUS_ICONS.get(s['status'], '❓')} {s['name'][:38]}"
+        if admin:
+            label += f" · u{s['user_id']}"
+        rows.append([_btn(label, f"menu:stream:{s['id']}")])
     if not streams:
         rows.append([_btn(t(lang, "btn_menu_newstream"), "menu:newstream")])
     rows.append([_btn(t(lang, "btn_back"), "menu:main")])
-    text = t(lang, "menu_streams_title") if streams else t(lang, "menu_streams_empty")
+    if not streams:
+        text = t(lang, "menu_streams_empty")
+    elif admin:
+        text = t(lang, "menu_streams_title_admin", n=len(streams))
+    else:
+        text = t(lang, "menu_streams_title")
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -451,7 +463,10 @@ async def _start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     is_first_stream = store.count_streams(user_id) == 0
 
-    stream_name = first_answer[:50]
+    # A tiny fast-model call turns the user's raw first message into a clean
+    # short title (falls back to a trim if the model is unavailable).
+    usage.set_user(user_id)
+    stream_name = await generate_stream_name(first_answer)
     stream_id = store.create_stream(
         user_id=user_id,
         name=stream_name,
@@ -793,15 +808,17 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_streams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all streams."""
-    lang = _lang(update.effective_user.id)
-    streams = store.get_streams_by_user(update.effective_user.id)
+    """List streams. The operator sees everyone's; users see their own."""
+    user_id = update.effective_user.id
+    lang = _lang(user_id)
+    admin = _is_admin(user_id)
+    streams = store.get_all_streams() if admin else store.get_streams_by_user(user_id)
 
     if not streams:
         await send_rich_async(update.effective_chat.id, t(lang, "streams_none"))
         return
 
-    markdown = t(lang, "streams_header")
+    markdown = t(lang, "streams_header_admin") if admin else t(lang, "streams_header")
 
     for s in streams:
         sources = store.get_sources_by_stream(s["id"])
@@ -810,7 +827,11 @@ async def cmd_streams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         status_emoji = {"active": "✅", "researching": "🔬", "paused": "⏸️"}.get(s["status"], "❓")
         status_word = t(lang, f"status_{s['status']}") \
             if s["status"] in ("active", "paused", "researching") else s["status"]
-        markdown += f"| {s['id']} | {name} | {status_emoji} {status_word} | {active} |\n"
+        if admin:
+            markdown += (f"| {s['id']} | {name} | u{s['user_id']} | "
+                         f"{status_emoji} {status_word} | {active} |\n")
+        else:
+            markdown += f"| {s['id']} | {name} | {status_emoji} {status_word} | {active} |\n"
 
     markdown += t(lang, "streams_footer")
 

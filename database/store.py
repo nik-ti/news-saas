@@ -76,6 +76,20 @@ def get_streams_by_user(user_id: int) -> list[dict]:
     return results
 
 
+def get_all_streams() -> list[dict]:
+    """Every stream across all users (operator view). Newest first."""
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM streams ORDER BY created_at DESC"
+        ).fetchall()
+    results = []
+    for row in rows:
+        d = dict(row)
+        d["criteria"] = json.loads(d["criteria"])
+        results.append(d)
+    return results
+
+
 def count_streams(user_id: int) -> int:
     with db() as conn:
         row = conn.execute(

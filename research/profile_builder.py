@@ -11,10 +11,60 @@ Two responsibilities:
 """
 import json
 import logging
+import re
 
 from research.llm import chat, chat_json
 
 logger = logging.getLogger(__name__)
+
+
+# ── Stream name ───────────────────────────────────────────────────────────────
+# The stream name is shown everywhere (the menu, /streams, research updates).
+# Seeding it from the user's raw first message gives ugly, truncated titles like
+# "Every 100 years the calendar shifts and I want to foll…". A tiny fast-model
+# call turns the request into a clean 2–5 word title instead.
+
+SYSTEM_PROMPT_NAME = """\
+You name a personalised news feed. Given what the user wants to follow, output a
+short, clear title — 2 to 5 words, in the SAME language as the request.
+
+Rules:
+- Title only. No quotes, no trailing punctuation, no explanation.
+- Name the subject, not the person's words. "I want to keep up with what's
+  happening in EU crypto law" → "EU Crypto Law".
+- Title Case for English; normal capitalisation for other languages."""
+
+
+def _clean_stream_name(raw: str) -> str:
+    """Reduce an LLM reply to a single clean title, or '' if unusable."""
+    if not raw:
+        return ""
+    line = raw.strip().splitlines()[0] if raw.strip() else ""
+    line = line.strip().strip("\"'`*").strip()
+    line = re.sub(r"^(title|name|название)\s*[:\-–]\s*", "", line, flags=re.I)
+    line = " ".join(line.split())
+    # A sane title isn't a whole sentence.
+    if not line or len(line) > 60 or len(line.split()) > 9:
+        return ""
+    return line
+
+
+async def generate_stream_name(topic: str) -> str:
+    """A short, clean title for a stream from the user's own words.
+
+    Falls back to a trimmed version of the request if the model is unavailable
+    or returns something unusable — naming must never block stream creation.
+    """
+    topic = (topic or "").strip()
+    fallback = topic[:50].rstrip() or "News"
+    if not topic:
+        return "News"
+    try:
+        raw = await chat(SYSTEM_PROMPT_NAME, f"Request: {topic}\n\nTitle:")
+    except Exception:
+        logger.exception("Stream name generation failed")
+        return fallback
+    return _clean_stream_name(raw) or fallback
 
 # ── Conversation opener ───────────────────────────────────────────────────────
 # Static, warm, human. The interviewer LLM takes over from the user's reply.

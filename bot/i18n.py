@@ -103,6 +103,12 @@ Everything here is also available as buttons — just send `/menu`.
         "en": "📋 <b>Your streams</b>\n\nPick one to manage it:",
         "ru": "📋 <b>Ваши потоки</b>\n\nВыберите, чтобы управлять:",
     },
+    "menu_streams_title_admin": {
+        "en": "📋 <b>All streams</b> ({n}) — operator view\n\n"
+              "Owner id is shown after each name. Pick one to manage it:",
+        "ru": "📋 <b>Все потоки</b> ({n}) — режим оператора\n\n"
+              "После названия — id владельца. Выберите, чтобы управлять:",
+    },
     "menu_streams_empty": {
         "en": "📭 You have no streams yet — create your first and tell me what "
               "news you want.",
@@ -443,6 +449,12 @@ Everything here is also available as buttons — just send `/menu`.
               "|----|------|--------|---------|\n",
         "ru": "# 📋 Ваши новостные потоки\n\n| ID | Название | Статус | Источники |\n"
               "|----|----------|--------|-----------|\n",
+    },
+    "streams_header_admin": {
+        "en": "# 📋 All Streams (operator)\n\n| ID | Name | Owner | Status | Sources |\n"
+              "|----|------|-------|--------|---------|\n",
+        "ru": "# 📋 Все потоки (оператор)\n\n| ID | Название | Владелец | Статус | Источники |\n"
+              "|----|----------|----------|--------|-----------|\n",
     },
     "streams_footer": {
         "en": "\nUse `/sources <id>` to view sources for a stream.",
