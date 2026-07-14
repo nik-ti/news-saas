@@ -128,20 +128,36 @@ async def test_admin_exempt_from_research_limit(temp_db, monkeypatch):
     assert ok_user is False and "research" in why
 
 
-async def test_start_shows_operator_commands_only_to_admin(temp_db, monkeypatch):
+async def test_help_shows_operator_commands_only_to_admin(temp_db, monkeypatch):
     monkeypatch.setattr(config, "ADMIN_USER_ID", 111)
     sent = _capture_sends(monkeypatch)
 
-    await handlers.cmd_start(_update(2), SimpleNamespace(args=[]))
-    await handlers.cmd_start(_update(111), SimpleNamespace(args=[]))
+    await handlers.cmd_help(_update(2), SimpleNamespace(args=[]))
+    await handlers.cmd_help(_update(111), SimpleNamespace(args=[]))
 
     user_text, admin_text = sent[0][1], sent[1][1]
-    assert "Operator commands" not in user_text
+    assert "Operator" not in user_text
     assert "/runpipeline" not in user_text
     assert "/sources_all" not in user_text
-    assert "Operator commands" in admin_text
+    assert "Operator" in admin_text
     assert "/runpipeline" in admin_text
     assert "/newstream" in user_text            # normal features still listed
+
+
+async def test_start_greets_via_menu(temp_db, monkeypatch):
+    # /start sends a short welcome with the button menu (not the command table).
+    monkeypatch.setattr(config, "ADMIN_USER_ID", 999)
+    sends = []
+
+    async def fake_bot_send(chat_id, text, **kw):
+        sends.append(text)
+    ctx = SimpleNamespace(args=[], bot=SimpleNamespace(send_message=fake_bot_send))
+    _capture_sends(monkeypatch)
+
+    store.set_ui_lang(2, "en")
+    await handlers.cmd_start(_update(2), ctx)
+    assert any("NewsStream" in s for s in sends)
+    assert any("guide" in s.lower() for s in sends)
 
 
 async def test_admin_notified_on_new_users_first_stream(temp_db, monkeypatch):

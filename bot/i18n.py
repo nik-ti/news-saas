@@ -16,66 +16,157 @@ DEFAULT_LANG = "en"
 SUPPORTED = ("en", "ru")
 
 STRINGS: dict[str, dict[str, str]] = {
-    # ── /start ────────────────────────────────────────────────────────────
+    # ── guide (telegra.ph) ────────────────────────────────────────────────
+    "guide_url": {
+        "en": "https://telegra.ph/NewsStream-Bot--User-Guide-07-14",
+        "ru": "https://telegra.ph/NewsStream--rukovodstvo-polzovatelya-07-14",
+    },
+
+    # ── /start (short welcome; the full command table lives in /help) ─────
     "start_user": {
+        "en": "🗞️ <b>NewsStream</b> — your personal news researcher.\n\n"
+              "Tell me in your own words what you want to stay on top of. I'll "
+              "find the best sites covering it, watch them around the clock, and "
+              "send you only the stories that match.\n\n"
+              "📖 <a href=\"{guide}\">How it works — 2-minute guide</a>\n"
+              "⌨️ /help lists every command.",
+        "ru": "🗞️ <b>NewsStream</b> — ваш личный новостной ассистент.\n\n"
+              "Расскажите своими словами, за чем хотите следить. Я найду лучшие "
+              "сайты по теме, буду наблюдать за ними круглосуточно и присылать "
+              "только те новости, которые вам нужны.\n\n"
+              "📖 <a href=\"{guide}\">Как это работает — гид за 2 минуты</a>\n"
+              "⌨️ /help — список всех команд.",
+    },
+    "help_user": {
         "en": """\
-# 🗞️ NewsStream Bot
+# ⌨️ Commands
 
-*Your personal news researcher.*
-
-Tell me what you want to stay on top of — in your own words — and I'll find \
-the best sources for it, watch them around the clock, and send you only the \
-stories that match.
-
-**Start with** `/newstream` — just describe your topic.
-
-## Your commands
+Everything here is also available as buttons — just send `/menu`.
 
 | Command | Description |
 |---------|-------------|
 | `/newstream` | Set up a news stream (just tell me what you want) |
+| `/menu` | The button menu |
 | `/streams` | List your streams |
-| `/sources <stream_id>` | See what a stream is watching |
-| `/addsource <stream_id> <url>` | Add a site you already like |
-| `/deletesource <source_id>` | Remove a source from your stream |
-| `/research <stream_id>` | Re-run source research for a stream |
-| `/latest` | Your latest fetched articles |
-| `/postsize <stream_id>` | Post length: standard / compact |
-| `/language` | Bot language · `/language <stream_id>` — post language |
-| `/pausestream <stream_id>` | Pause a stream |
-| `/resumestream <stream_id>` | Resume a paused stream |
-| `/deletestream <stream_id>` | Delete a stream |
-| `/quiet <stream_id> 23-8` | No posts between those hours (`off` to clear) |\
+| `/sources 3` | What stream 3 is watching |
+| `/addsource 3 site.com` | Add a site you like to stream 3 |
+| `/deletesource 12` | Remove source 12 from your stream |
+| `/research 3` | Redo source research for stream 3 |
+| `/latest` | Your latest collected articles |
+| `/postsize 3` | Post length: standard / compact |
+| `/language` | Bot language · `/language 3` — post language |
+| `/pausestream 3` | Pause a stream |
+| `/resumestream 3` | Resume a paused stream |
+| `/deletestream 3` | Delete a stream |
+| `/quiet 3 23-8` | No posts between those hours (`off` to clear) |
+
+📖 [Full guide]({guide})\
 """,
         "ru": """\
-# 🗞️ NewsStream Bot
+# ⌨️ Команды
 
-*Ваш личный новостной ассистент.*
-
-Расскажите своими словами, за чем хотите следить, — я найду лучшие источники, \
-буду наблюдать за ними круглосуточно и присылать только те новости, которые \
-вам действительно нужны.
-
-**Начните с** `/newstream` — просто опишите тему.
-
-## Ваши команды
+Всё это есть и кнопками — просто отправьте `/menu`.
 
 | Команда | Описание |
 |---------|----------|
 | `/newstream` | Создать новостной поток (просто расскажите, что нужно) |
+| `/menu` | Меню с кнопками |
 | `/streams` | Список ваших потоков |
-| `/sources <stream_id>` | Источники потока |
-| `/addsource <stream_id> <url>` | Добавить свой сайт |
-| `/deletesource <source_id>` | Убрать источник из потока |
-| `/research <stream_id>` | Заново подобрать источники |
+| `/sources 3` | За чем следит поток 3 |
+| `/addsource 3 site.com` | Добавить свой сайт в поток 3 |
+| `/deletesource 12` | Убрать источник 12 из потока |
+| `/research 3` | Заново подобрать источники для потока 3 |
 | `/latest` | Последние собранные статьи |
-| `/postsize <stream_id>` | Длина постов: обычная / короткая |
-| `/language` | Язык бота · `/language <stream_id>` — язык постов |
-| `/pausestream <stream_id>` | Приостановить поток |
-| `/resumestream <stream_id>` | Возобновить поток |
-| `/deletestream <stream_id>` | Удалить поток |
-| `/quiet <stream_id> 23-8` | Тихие часы — без постов в это время (`off` — отключить) |\
+| `/postsize 3` | Длина постов: обычная / короткая |
+| `/language` | Язык бота · `/language 3` — язык постов |
+| `/pausestream 3` | Приостановить поток |
+| `/resumestream 3` | Возобновить поток |
+| `/deletestream 3` | Удалить поток |
+| `/quiet 3 23-8` | Тихие часы — без постов в это время (`off` — отключить) |
+
+📖 [Полный гид]({guide})\
 """,
+    },
+
+    # ── menu screens ──────────────────────────────────────────────────────
+    "menu_main": {
+        "en": "🗞️ <b>NewsStream</b>\n\nWhat would you like to do?",
+        "ru": "🗞️ <b>NewsStream</b>\n\nЧто сделать?",
+    },
+    "btn_menu_newstream": {"en": "➕ New stream", "ru": "➕ Новый поток"},
+    "btn_menu_streams": {"en": "📋 My streams", "ru": "📋 Мои потоки"},
+    "btn_menu_latest": {"en": "📰 Latest articles", "ru": "📰 Последние статьи"},
+    "btn_menu_language": {"en": "🌐 Language", "ru": "🌐 Язык"},
+    "btn_menu_guide": {"en": "📖 Guide", "ru": "📖 Гид"},
+    "btn_back": {"en": "⬅️ Back", "ru": "⬅️ Назад"},
+    "menu_streams_title": {
+        "en": "📋 <b>Your streams</b>\n\nPick one to manage it:",
+        "ru": "📋 <b>Ваши потоки</b>\n\nВыберите, чтобы управлять:",
+    },
+    "menu_streams_empty": {
+        "en": "📭 You have no streams yet — create your first and tell me what "
+              "news you want.",
+        "ru": "📭 Потоков пока нет — создайте первый и расскажите, какие новости "
+              "вам нужны.",
+    },
+    "scr_stream": {
+        "en": "<b>{name}</b>\n"
+              "Status: {status}\n"
+              "Sources: {n_sources}\n"
+              "Posts: {length}, in {language}\n"
+              "Quiet hours: {quiet}",
+        "ru": "<b>{name}</b>\n"
+              "Статус: {status}\n"
+              "Источников: {n_sources}\n"
+              "Посты: {length}, язык — {language}\n"
+              "Тихие часы: {quiet}",
+    },
+    "word_standard": {"en": "standard", "ru": "обычные"},
+    "word_compact": {"en": "compact", "ru": "короткие"},
+    "word_off": {"en": "off", "ru": "выкл"},
+    "btn_sources": {"en": "📰 Sources", "ru": "📰 Источники"},
+    "btn_add_source": {"en": "➕ Add source", "ru": "➕ Добавить источник"},
+    "btn_pause": {"en": "⏸ Pause", "ru": "⏸ Пауза"},
+    "btn_resume": {"en": "▶️ Resume", "ru": "▶️ Возобновить"},
+    "btn_postlen": {"en": "📏 Post length", "ru": "📏 Длина постов"},
+    "btn_postlang": {"en": "🌐 Post language", "ru": "🌐 Язык постов"},
+    "btn_quiet": {"en": "🔕 Quiet hours", "ru": "🔕 Тихие часы"},
+    "btn_research": {"en": "🔄 Redo research", "ru": "🔄 Подобрать заново"},
+    "btn_delete_stream": {"en": "🗑 Delete stream", "ru": "🗑 Удалить поток"},
+    "menu_sources_title": {
+        "en": "📰 <b>Sources of “{name}”</b>\n\nTap 🗑 to remove one:",
+        "ru": "📰 <b>Источники потока «{name}»</b>\n\nНажмите 🗑, чтобы убрать:",
+    },
+    "menu_sources_empty": {
+        "en": "This stream has no sources yet — add a site you like.",
+        "ru": "У потока пока нет источников — добавьте сайт, который вам нравится.",
+    },
+    "menu_quiet_title": {
+        "en": "🔕 <b>Quiet hours for “{name}”</b>\n\nNo posts inside the window; "
+              "anything held arrives after it ends. Pick a window:",
+        "ru": "🔕 <b>Тихие часы для «{name}»</b>\n\nВ это время посты не приходят; "
+              "всё накопившееся придёт после. Выберите окно:",
+    },
+    "btn_quiet_off": {"en": "🔔 Off (24/7)", "ru": "🔔 Выкл (круглосуточно)"},
+    "menu_plen_title": {
+        "en": "📏 <b>Post length for “{name}”</b>",
+        "ru": "📏 <b>Длина постов для «{name}»</b>",
+    },
+    "menu_slang_title": {
+        "en": "🌐 <b>Post language for “{name}”</b>",
+        "ru": "🌐 <b>Язык постов для «{name}»</b>",
+    },
+    "addsrc_prompt": {
+        "en": "➕ Send me the site's address — just the site, like "
+              "<code>techcrunch.com</code>. I'll find its news page myself.",
+        "ru": "➕ Пришлите адрес сайта — просто сайт, например "
+              "<code>techcrunch.com</code>. Страницу новостей я найду сам.",
+    },
+    "addsrc_not_a_url": {
+        "en": "That doesn't look like a site address. Send something like "
+              "<code>techcrunch.com</code> — or tap Back.",
+        "ru": "Это не похоже на адрес сайта. Пришлите что-то вроде "
+              "<code>techcrunch.com</code> — или нажмите «Назад».",
     },
 
     # ── interview ─────────────────────────────────────────────────────────
@@ -149,10 +240,10 @@ stories that match.
               "начну присылать подходящие новости.",
     },
     "res_pending": {
-        "en": "\n⏳ {n} listed no articles on the first read — they stay on "
-              "watch and count as live the moment they yield.",
-        "ru": "\n⏳ {n} при первой проверке не показали статей — они остаются "
-              "под наблюдением и включатся, как только что-то появится.",
+        "en": "\n⏳ {n} showed no articles on the first look — I'll keep an eye "
+              "on them and they'll switch on as soon as something appears.",
+        "ru": "\n⏳ {n} при первой проверке не показали статей — я буду за ними "
+              "присматривать, и они включатся, как только что-то появится.",
     },
     "res_blocked": {
         "en": "\n🔄 {n} were busy when I checked — I'll keep retrying them "
@@ -168,12 +259,12 @@ stories that match.
               "добавить через `/addsource` издание, которому вы доверяете.",
     },
     "res_finetune": {
-        "en": "\nWant to fine-tune? `/sources {stream_id}` shows the full list "
-              "— drop any with `/deletesource <id>` or add your own with "
-              "`/addsource {stream_id} <url>`.",
-        "ru": "\nХотите настроить точнее? `/sources {stream_id}` покажет весь "
-              "список — уберите лишнее через `/deletesource <id>` или добавьте "
-              "своё: `/addsource {stream_id} <url>`.",
+        "en": "\nWant to fine-tune? Open `/menu` → My streams → this stream: "
+              "you can remove any source or add a site you like with a couple "
+              "of taps.",
+        "ru": "\nХотите настроить точнее? Откройте `/menu` → Мои потоки → этот "
+              "поток: там пара нажатий, чтобы убрать источник или добавить "
+              "свой сайт.",
     },
     "res_none": {
         "en": "I dug through a lot of sites but couldn't find sources solid "
@@ -181,22 +272,24 @@ stories that match.
               "is very narrow, or worth phrasing a little differently.\n\n"
               "A couple of options:\n"
               "• `/research {stream_id}` — I'll take another pass at it.\n"
-              "• `/addsource {stream_id} <url>` — point me at a site you "
-              "already like and I'll build from there.",
+              "• Add a site you already like: `/menu` → My streams → this "
+              "stream → Add source.",
         "ru": "Я просмотрел много сайтов, но пока не нашёл достаточно "
               "надёжных источников — обычно это значит, что тема очень узкая "
               "или её стоит сформулировать чуть иначе.\n\nВарианты:\n"
               "• `/research {stream_id}` — попробую ещё раз.\n"
-              "• `/addsource {stream_id} <url>` — покажите сайт, который вам "
-              "нравится, и я оттолкнусь от него.",
+              "• Добавьте сайт, который вам нравится: `/menu` → Мои потоки → "
+              "этот поток → Добавить источник.",
     },
     "research_error": {
         "en": "❌ Research error: {e}",
         "ru": "❌ Ошибка при подборе источников: {e}",
     },
     "research_usage": {
-        "en": "Usage: `/research <stream_id>`",
-        "ru": "Формат: `/research <stream_id>`",
+        "en": "Add the stream number — e.g. `/research 3`. `/streams` shows "
+              "the numbers.",
+        "ru": "Добавьте номер потока — например, `/research 3`. Номера — в "
+              "`/streams`.",
     },
     "research_rerun": {
         "en": "🔬 Re-running research for stream `{stream_id}`...",
@@ -209,20 +302,22 @@ stories that match.
 
     # ── shared errors ─────────────────────────────────────────────────────
     "invalid_stream_id": {
-        "en": "Invalid stream ID.",
-        "ru": "Некорректный ID потока.",
+        "en": "I don't recognise that stream number — `/streams` shows yours.",
+        "ru": "Не узнаю этот номер потока — `/streams` покажет ваши.",
     },
     "not_your_stream": {
         "en": "❌ That stream isn't yours.",
         "ru": "❌ Это не ваш поток.",
     },
     "stream_not_found": {
-        "en": "❌ Stream `{stream_id}` not found.",
-        "ru": "❌ Поток `{stream_id}` не найден.",
+        "en": "❌ I can't find stream {stream_id} — `/streams` shows yours.",
+        "ru": "❌ Не нахожу поток {stream_id} — `/streams` покажет ваши.",
     },
     "lifecycle_usage": {
-        "en": "Usage: give me a stream id — `/streams` lists yours.",
-        "ru": "Укажите ID потока — `/streams` покажет ваши.",
+        "en": "Which stream? Add its number — e.g. `/pausestream 3`. "
+              "`/streams` shows the numbers.",
+        "ru": "Какой поток? Добавьте его номер — например, `/pausestream 3`. "
+              "Номера — в `/streams`.",
     },
 
     # ── /postsize ─────────────────────────────────────────────────────────
@@ -231,8 +326,10 @@ stories that match.
         "ru": "У вас пока нет потоков. Начните с `/newstream`.",
     },
     "postsize_usage": {
-        "en": "Usage: `/postsize <stream_id>` — I'll show the options.",
-        "ru": "Формат: `/postsize <stream_id>` — покажу варианты.",
+        "en": "Add the stream number — e.g. `/postsize 3` — and I'll show the "
+              "options. `/streams` shows the numbers.",
+        "ru": "Добавьте номер потока — например, `/postsize 3` — и я покажу "
+              "варианты. Номера — в `/streams`.",
     },
     "postsize_pick": {
         "en": "Posts for \"{name}\" are currently \"{current}\". Pick a size:",
@@ -257,10 +354,10 @@ stories that match.
 
     # ── /language ─────────────────────────────────────────────────────────
     "lang_pick_ui": {
-        "en": "Which language should I speak to you in?\n(Tip: `/language "
-              "<stream_id>` sets the language of a stream's POSTS.)",
-        "ru": "На каком языке мне с вами говорить?\n(Подсказка: `/language "
-              "<stream_id>` задаёт язык ПОСТОВ конкретного потока.)",
+        "en": "Which language should I speak to you in?\n(Tip: `/language 3` "
+              "sets the language of stream 3's POSTS.)",
+        "ru": "На каком языке мне с вами говорить?\n(Подсказка: `/language 3` "
+              "задаёт язык ПОСТОВ потока 3.)",
     },
     "lang_pick_stream": {
         "en": "Posts for \"{name}\" are currently in {current}. Pick a language:",
@@ -281,16 +378,16 @@ stories that match.
 
     # ── stream lifecycle ──────────────────────────────────────────────────
     "stream_paused": {
-        "en": "⏸️ **{name}** is paused — nothing will be posted and its "
-              "sources stop being crawled. `/resumestream {stream_id}` brings "
-              "it back.",
-        "ru": "⏸️ **{name}** на паузе — посты не приходят, источники не "
-              "проверяются. Вернуть: `/resumestream {stream_id}`.",
+        "en": "⏸️ **{name}** is paused — no posts, and I stop checking its "
+              "sites. `/resumestream {stream_id}` brings it back.",
+        "ru": "⏸️ **{name}** на паузе — посты не приходят, сайты я не проверяю. "
+              "Вернуть: `/resumestream {stream_id}`.",
     },
     "stream_resumed": {
-        "en": "▶️ **{name}** is active again. Sources resume on the next cycle.",
-        "ru": "▶️ **{name}** снова активен. Источники включатся со следующего "
-              "цикла.",
+        "en": "▶️ **{name}** is active again — I'll start checking its sites "
+              "within half an hour.",
+        "ru": "▶️ **{name}** снова активен — начну проверять его сайты в "
+              "ближайшие полчаса.",
     },
     "delete_confirm": {
         "en": "Delete \"{name}\" and its {n} source subscription(s)? "
@@ -311,10 +408,12 @@ stories that match.
 
     # ── /quiet ────────────────────────────────────────────────────────────
     "quiet_usage": {
-        "en": "Usage: `/quiet <stream_id> 23-8` — no posts from 23:00 to 08:00 "
-              "(server time). `/quiet <stream_id> off` clears it.",
-        "ru": "Формат: `/quiet <stream_id> 23-8` — без постов с 23:00 до 08:00 "
-              "(время сервера). `/quiet <stream_id> off` — отключить.",
+        "en": "For example: `/quiet 3 23-8` — no posts from 23:00 to 08:00 "
+              "(server time). `/quiet 3 off` turns quiet hours off. Easier "
+              "with buttons: `/menu` → the stream → Quiet hours.",
+        "ru": "Например: `/quiet 3 23-8` — без постов с 23:00 до 08:00 (время "
+              "сервера). `/quiet 3 off` — отключить. Проще кнопками: `/menu` → "
+              "поток → Тихие часы.",
     },
     "quiet_cleared": {
         "en": "🔔 Quiet hours cleared for **{name}** — posts flow 24/7.",
@@ -355,8 +454,10 @@ stories that match.
 
     # ── /sources ──────────────────────────────────────────────────────────
     "sources_usage": {
-        "en": "Usage: `/sources <stream_id>`",
-        "ru": "Формат: `/sources <stream_id>`",
+        "en": "Add the stream number — e.g. `/sources 3`. `/streams` shows "
+              "the numbers.",
+        "ru": "Добавьте номер потока — например, `/sources 3`. Номера — в "
+              "`/streams`.",
     },
     "sources_none": {
         "en": "📭 No sources found for stream `{stream_id}`.",
@@ -370,7 +471,7 @@ stories that match.
     },
     "sources_details": {"en": "\n---\n## Details\n", "ru": "\n---\n## Подробнее\n"},
     "sources_site": {"en": "- Site: {url}", "ru": "- Сайт: {url}"},
-    "sources_polling": {"en": "- Polling: {url}", "ru": "- Опрашивается: {url}"},
+    "sources_polling": {"en": "- Watching: {url}", "ru": "- Слежу за: {url}"},
     "sources_score_status": {
         "en": "- Score: {score}/100 · Status: {status}",
         "ru": "- Оценка: {score}/100 · Статус: {status}",
@@ -391,28 +492,32 @@ stories that match.
 
     # ── /addsource ────────────────────────────────────────────────────────
     "addsource_usage": {
-        "en": "Usage: `/addsource <stream_id> <url>`",
-        "ru": "Формат: `/addsource <stream_id> <url>`",
+        "en": "Send the stream number and the site — e.g. "
+              "`/addsource 3 techcrunch.com`.",
+        "ru": "Пришлите номер потока и сайт — например, "
+              "`/addsource 3 techcrunch.com`.",
     },
     "addsource_looking": {
-        "en": "🔍 Looking for the news page on `{url}`...\n\n_Checking for "
-              "feeds, section pages, and site navigation. This takes a moment._",
-        "ru": "🔍 Ищу страницу новостей на `{url}`...\n\n_Проверяю ленты, "
-              "разделы и навигацию сайта. Это займёт немного времени._",
+        "en": "🔍 Looking for the news page on `{url}`...\n\n_This takes a "
+              "moment._",
+        "ru": "🔍 Ищу страницу новостей на `{url}`...\n\n_Это займёт немного "
+              "времени._",
     },
     "addsource_inspect_error": {
-        "en": "❌ Couldn't inspect that site: {e}",
-        "ru": "❌ Не удалось изучить этот сайт: {e}",
+        "en": "❌ I couldn't read that site right now — it may be down or "
+              "refusing visitors. Try again a bit later.",
+        "ru": "❌ Сейчас не получилось прочитать этот сайт — возможно, он не "
+              "работает или не пускает. Попробуйте чуть позже.",
     },
     "addsource_none_found": {
-        "en": "I crawled <b>{url}</b> — its feeds, common news paths, and its "
-              "own navigation — and couldn't find any page that lists articles."
-              "\n\nThat usually means the site doesn't publish a news feed, or "
-              "it blocks crawlers.\n\nAdd it anyway and poll the URL as given?",
-        "ru": "Я обошёл <b>{url}</b> — ленты, типовые разделы новостей и "
-              "навигацию — и не нашёл страницы со списком статей.\n\nОбычно "
-              "это значит, что у сайта нет новостной ленты или он блокирует "
-              "роботов.\n\nДобавить всё равно и опрашивать адрес как есть?",
+        "en": "I looked all over <b>{url}</b> and couldn't find a page that "
+              "lists its articles.\n\nThat usually means the site doesn't "
+              "publish news, or it blocks automated readers.\n\nAdd it anyway "
+              "and check the address as given?",
+        "ru": "Я обошёл <b>{url}</b> целиком и не нашёл страницы со списком "
+              "статей.\n\nОбычно это значит, что сайт не публикует новости или "
+              "не пускает автоматических читателей.\n\nДобавить всё равно и "
+              "проверять адрес как есть?",
     },
     "btn_add_anyway": {"en": "➕ Add anyway", "ru": "➕ Добавить всё равно"},
     "btn_cancel": {"en": "✖️ Cancel", "ru": "✖️ Отмена"},
@@ -427,16 +532,16 @@ stories that match.
         "ru": "{icon} {url} · статей: {n}",
     },
     "source_added": {
-        "en": "✅ **Source added** — `{source_id}`\n\n**Site:** {site}\n"
-              "**Polling:** {poll}\n_Found via {kind} — {n} articles detected._"
-              "\n\nI'll baseline it on the next cycle: everything published so "
-              "far is recorded silently, and you'll only hear about what "
-              "appears *after* that.",
-        "ru": "✅ **Источник добавлен** — `{source_id}`\n\n**Сайт:** {site}\n"
-              "**Опрашивается:** {poll}\n_Найдено через {kind} — статей: {n}._"
-              "\n\nВ следующем цикле я сниму «нулевую точку»: всё уже "
-              "опубликованное запишется молча, а присылать буду только то, "
-              "что появится *после*.",
+        "en": "✅ **Source added** — {name}\n\n**Site:** {site}\n"
+              "**Watching:** {poll}\n_Found its {kind} — {n} articles there now._"
+              "\n\nFrom here on I'm watching it: everything already published "
+              "stays quiet, and you'll only hear about what appears *after* "
+              "this moment.",
+        "ru": "✅ **Источник добавлен** — {name}\n\n**Сайт:** {site}\n"
+              "**Слежу за:** {poll}\n_Нашёл {kind} — сейчас там статей: {n}._"
+              "\n\nС этого момента я слежу за ним: всё уже опубликованное "
+              "останется в тишине, а присылать буду только то, что появится "
+              "*после*.",
     },
     "kind_feed": {"en": "RSS feed", "ru": "RSS-ленту"},
     "kind_page": {"en": "article page", "ru": "страницу статей"},
@@ -449,12 +554,12 @@ stories that match.
         "ru": "⚠️ Этот источник уже есть в потоке.",
     },
     "added_anyway": {
-        "en": "➕ **Added anyway** — `{source_id}`\n\nI'll poll {url} directly. "
-              "If it never yields articles it will be marked as errored after "
-              "a few cycles.",
-        "ru": "➕ **Добавлено как есть** — `{source_id}`\n\nБуду опрашивать "
-              "{url} напрямую. Если статей так и не появится, через несколько "
-              "циклов источник будет помечен как нерабочий.",
+        "en": "➕ **Added anyway**\n\nI'll check {url} as given. If it never "
+              "shows anything readable, I'll stop checking it and mark it in "
+              "your sources list.",
+        "ru": "➕ **Добавлено как есть**\n\nБуду проверять {url} как есть. Если "
+              "там так и не появится ничего читаемого, я перестану проверять и "
+              "отмечу это в списке источников.",
     },
     "added_as_is": {"en": "Added as-is.", "ru": "Добавлено как есть."},
     "cancelled_nothing_added": {
@@ -473,20 +578,22 @@ stories that match.
 
     # ── /deletesource ─────────────────────────────────────────────────────
     "deletesource_usage": {
-        "en": "Usage: `/deletesource <source_id>`",
-        "ru": "Формат: `/deletesource <source_id>`",
+        "en": "Add the source number — e.g. `/deletesource 12`. The numbers "
+              "are in `/sources`, or just use the buttons in `/menu`.",
+        "ru": "Добавьте номер источника — например, `/deletesource 12`. Номера "
+              "— в `/sources`, а проще — кнопками в `/menu`.",
     },
     "invalid_source_id": {
-        "en": "Invalid source ID.",
-        "ru": "Некорректный ID источника.",
+        "en": "I don't recognise that source number — `/sources 3` shows them, "
+              "or use the buttons in `/menu`.",
+        "ru": "Не узнаю этот номер источника — `/sources 3` покажет номера, а "
+              "проще — кнопками в `/menu`.",
     },
     "source_not_found": {
-        "en": "❌ No source with ID `{source_id}`.\n\nUse `/sources "
-              "<stream_id>` — the **ID** column is what you pass here, not the "
-              "row position.",
-        "ru": "❌ Источника с ID `{source_id}` нет.\n\nОткройте `/sources "
-              "<stream_id>` — сюда передаётся значение из колонки **ID**, а не "
-              "номер строки.",
+        "en": "❌ I can't find source {source_id}. The numbers are in the "
+              "first column of `/sources` — or just use the buttons in `/menu`.",
+        "ru": "❌ Не нахожу источник {source_id}. Номера — в первой колонке "
+              "`/sources`, а проще — кнопками в `/menu`.",
     },
     "source_not_on_streams": {
         "en": "❌ That source isn't on any of your streams.",

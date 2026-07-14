@@ -77,13 +77,13 @@ async def test_ulang_callback_sets_interface_language(temp_db, monkeypatch):
     update, edits = _query(7, "ulang:ru")
     await handlers.handle_callback(update, SimpleNamespace(user_data={}))
     assert store.get_ui_lang(7) == "ru"
-    # Confirmation arrives in the NEWLY chosen language.
-    assert edits == [t("ru", "lang_ui_set")]
+    # The menu re-renders in the newly chosen language.
+    assert edits and edits[0] == t("ru", "menu_main")
 
     update, edits = _query(7, "ulang:en")
     await handlers.handle_callback(update, SimpleNamespace(user_data={}))
     assert store.get_ui_lang(7) == "en"
-    assert edits == [t("en", "lang_ui_set")]
+    assert edits and edits[0] == t("en", "menu_main")
 
 
 async def test_slang_callback_sets_stream_post_language(temp_db, monkeypatch):
@@ -131,8 +131,8 @@ async def test_russian_user_gets_russian_interface(temp_db, monkeypatch):
     await handlers.cmd_streams(_update(9), SimpleNamespace(args=[]))
     assert sent[-1] == t("ru", "streams_none")
 
-    await handlers.cmd_start(_update(9), SimpleNamespace(args=[]))
-    assert "Ваши команды" in sent[-1]
+    await handlers.cmd_help(_update(9), SimpleNamespace(args=[]))
+    assert "Команды" in sent[-1]
     assert "/language" in sent[-1]
 
 

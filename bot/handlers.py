@@ -4,6 +4,7 @@ Uses python-telegram-bot ConversationHandler for the multi-step /newstream flow.
 """
 import asyncio
 import functools
+import html as html_mod
 import logging
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -84,12 +85,267 @@ You also bypass the per-user limits and can manage any user's stream by id.\
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Welcome message; admins additionally see the operator commands."""
+    """Short welcome + guide link + the button menu."""
     user_id = update.effective_user.id
-    text = t(_lang(user_id), "start_user")
+    lang = _lang(user_id)
+    _, keyboard = _screen_main(lang)
+    await context.bot.send_message(
+        update.effective_chat.id,
+        t(lang, "start_user", guide=t(lang, "guide_url")),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=keyboard,
+    )
     if _is_admin(user_id):
-        text += _START_ADMIN_EXTRA  # operator strings stay English by design
+        # Operator strings stay English by design.
+        await send_rich_async(update.effective_chat.id,
+                              "# Operator" + _START_ADMIN_EXTRA)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The full command table (everything is also in /menu as buttons)."""
+    user_id = update.effective_user.id
+    text = t(_lang(user_id), "help_user", guide=t(_lang(user_id), "guide_url"))
+    if _is_admin(user_id):
+        text += _START_ADMIN_EXTRA
     await send_rich_async(update.effective_chat.id, text)
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The button menu — every common action without typing a command."""
+    lang = _lang(update.effective_user.id)
+    text, keyboard = _screen_main(lang)
+    await context.bot.send_message(update.effective_chat.id, text,
+                                   parse_mode="HTML", reply_markup=keyboard)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Menu screens — each builder returns (text, keyboard); navigation edits the
+# same message in place, so Back always works.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _btn(text: str, cb: str = None, url: str = None) -> InlineKeyboardButton:
+    if url:
+        return InlineKeyboardButton(text, url=url)
+    return InlineKeyboardButton(text, callback_data=cb)
+
+
+def _screen_main(lang: str) -> tuple[str, InlineKeyboardMarkup]:
+    rows = [
+        [_btn(t(lang, "btn_menu_newstream"), "menu:newstream")],
+        [_btn(t(lang, "btn_menu_streams"), "menu:streams")],
+        [_btn(t(lang, "btn_menu_language"), "menu:language"),
+         _btn(t(lang, "btn_menu_guide"), url=t(lang, "guide_url"))],
+    ]
+    return t(lang, "menu_main"), InlineKeyboardMarkup(rows)
+
+
+_STATUS_ICONS = {"active": "✅", "paused": "⏸", "researching": "🔬"}
+
+
+def _screen_streams(user_id: int, lang: str) -> tuple[str, InlineKeyboardMarkup]:
+    streams = store.get_streams_by_user(user_id)
+    rows = [[_btn(f"{_STATUS_ICONS.get(s['status'], '❓')} {s['name'][:40]}",
+                  f"menu:stream:{s['id']}")] for s in streams[:20]]
+    if not streams:
+        rows.append([_btn(t(lang, "btn_menu_newstream"), "menu:newstream")])
+    rows.append([_btn(t(lang, "btn_back"), "menu:main")])
+    text = t(lang, "menu_streams_title") if streams else t(lang, "menu_streams_empty")
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _post_lang_code(criteria: dict) -> str:
+    raw = str((criteria or {}).get("post_language")
+              or (criteria or {}).get("language") or "").lower()
+    return "ru" if raw.startswith(("ru", "рус")) else "en"
+
+
+def _screen_stream(stream: dict, lang: str) -> tuple[str, InlineKeyboardMarkup]:
+    sid = stream["id"]
+    criteria = stream.get("criteria") or {}
+    if not isinstance(criteria, dict):
+        criteria = {}
+    n_sources = len(store.get_sources_by_stream(sid))
+    status = (t(lang, f"status_{stream['status']}")
+              if stream["status"] in ("active", "paused", "researching")
+              else stream["status"])
+    length_key = ("word_compact" if criteria.get("post_length") == "compact"
+                  else "word_standard")
+    text = t(lang, "scr_stream",
+             name=html_mod.escape(stream["name"]),
+             status=f"{_STATUS_ICONS.get(stream['status'], '')} {status}",
+             n_sources=n_sources,
+             length=t(lang, length_key),
+             language=t(lang, f"lang_name_{_post_lang_code(criteria)}"),
+             quiet=criteria.get("quiet_hours") or t(lang, "word_off"))
+
+    toggle = (_btn(t(lang, "btn_resume"), f"menu:resume:{sid}")
+              if stream["status"] == "paused"
+              else _btn(t(lang, "btn_pause"), f"menu:pause:{sid}"))
+    rows = [
+        [_btn(t(lang, "btn_sources"), f"menu:sources:{sid}"),
+         _btn(t(lang, "btn_add_source"), f"menu:addsrc:{sid}")],
+        [toggle, _btn(t(lang, "btn_research"), f"menu:research:{sid}")],
+        [_btn(t(lang, "btn_postlen"), f"menu:plen:{sid}"),
+         _btn(t(lang, "btn_postlang"), f"menu:slang:{sid}")],
+        [_btn(t(lang, "btn_quiet"), f"menu:quiet:{sid}"),
+         _btn(t(lang, "btn_delete_stream"), f"menu:delstream:{sid}")],
+        [_btn(t(lang, "btn_back"), "menu:streams")],
+    ]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _screen_sources(stream: dict, lang: str) -> tuple[str, InlineKeyboardMarkup]:
+    sid = stream["id"]
+    sources = store.get_sources_by_stream(sid)
+    src_icons = {"active": "✅", "blocked": "🚫", "error": "⚠️"}
+    if sources:
+        text = t(lang, "menu_sources_title",
+                 name=html_mod.escape(stream["name"]))
+        rows = [[_btn(f"🗑 {src_icons.get(s['fetch_status'], '❓')} "
+                      f"{(s.get('name') or s['url'])[:36]}",
+                      f"msrc_del:{sid}:{s['id']}")] for s in sources[:15]]
+    else:
+        text = t(lang, "menu_sources_empty")
+        rows = []
+    rows.append([_btn(t(lang, "btn_add_source"), f"menu:addsrc:{sid}")])
+    rows.append([_btn(t(lang, "btn_back"), f"menu:stream:{sid}")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _screen_quiet(stream: dict, lang: str) -> tuple[str, InlineKeyboardMarkup]:
+    sid = stream["id"]
+    rows = [
+        [_btn("23:00–08:00", f"mquiet:{sid}:23-8"),
+         _btn("22:00–09:00", f"mquiet:{sid}:22-9")],
+        [_btn("00:00–08:00", f"mquiet:{sid}:0-8"),
+         _btn(t(lang, "btn_quiet_off"), f"mquiet:{sid}:off")],
+        [_btn(t(lang, "btn_back"), f"menu:stream:{sid}")],
+    ]
+    return (t(lang, "menu_quiet_title", name=html_mod.escape(stream["name"])),
+            InlineKeyboardMarkup(rows))
+
+
+def _screen_plen(stream: dict, lang: str) -> tuple[str, InlineKeyboardMarkup]:
+    sid = stream["id"]
+    rows = [
+        [_btn(t(lang, "btn_standard"), f"plen:{sid}:standard"),
+         _btn(t(lang, "btn_compact"), f"plen:{sid}:compact")],
+        [_btn(t(lang, "btn_back"), f"menu:stream:{sid}")],
+    ]
+    return (t(lang, "menu_plen_title", name=html_mod.escape(stream["name"])),
+            InlineKeyboardMarkup(rows))
+
+
+def _screen_slang(stream: dict, lang: str) -> tuple[str, InlineKeyboardMarkup]:
+    sid = stream["id"]
+    rows = [
+        [_btn(t(lang, "btn_lang_en"), f"slang:{sid}:en"),
+         _btn(t(lang, "btn_lang_ru"), f"slang:{sid}:ru")],
+        [_btn(t(lang, "btn_back"), f"menu:stream:{sid}")],
+    ]
+    return (t(lang, "menu_slang_title", name=html_mod.escape(stream["name"])),
+            InlineKeyboardMarkup(rows))
+
+
+def _back_kb(lang: str, cb: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[_btn(t(lang, "btn_back"), cb)]])
+
+
+def _screen_language(lang: str) -> tuple[str, InlineKeyboardMarkup]:
+    rows = [
+        [_btn(t(lang, "btn_lang_en"), "ulang:en"),
+         _btn(t(lang, "btn_lang_ru"), "ulang:ru")],
+        [_btn(t(lang, "btn_back"), "menu:main")],
+    ]
+    return t(lang, "lang_pick_ui"), InlineKeyboardMarkup(rows)
+
+
+async def _safe_edit(query, text: str, keyboard: InlineKeyboardMarkup) -> None:
+    """Edit the menu message in place; ignore Telegram's 'not modified' noise."""
+    try:
+        await query.edit_message_text(text, parse_mode="HTML",
+                                      disable_web_page_preview=True,
+                                      reply_markup=keyboard)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logger.debug("menu edit failed: %s", e)
+
+
+async def _owned_stream_for_menu(query, user_id: int, lang: str, sid: str):
+    """Parse + ownership-check a stream id from menu callback data."""
+    try:
+        owns, stream = await _owns_stream(user_id, int(sid))
+    except ValueError:
+        return None
+    if stream is None or not owns:
+        await query.edit_message_text(t(lang, "not_your_stream"))
+        return None
+    return stream
+
+
+async def _handle_menu_nav(query, context, user_id: int, lang: str,
+                           action: str) -> None:
+    """Route a `menu:*` button. Each branch edits the message to a new screen."""
+    # ── top-level ──────────────────────────────────────────────────────
+    if action == "main":
+        await _safe_edit(query, *_screen_main(lang))
+        return
+    if action == "streams":
+        await _safe_edit(query, *_screen_streams(user_id, lang))
+        return
+    if action == "language":
+        await _safe_edit(query, *_screen_language(lang))
+        return
+    # "newstream" is handled by the conversation's callback entry point.
+
+    verb, _, sid = action.partition(":")
+    if not sid:
+        return
+    stream = await _owned_stream_for_menu(query, user_id, lang, sid)
+    if stream is None:
+        return
+    sid_int = stream["id"]
+
+    if verb == "stream":
+        await _safe_edit(query, *_screen_stream(stream, lang))
+    elif verb == "sources":
+        await _safe_edit(query, *_screen_sources(stream, lang))
+    elif verb == "quiet":
+        await _safe_edit(query, *_screen_quiet(stream, lang))
+    elif verb == "plen":
+        await _safe_edit(query, *_screen_plen(stream, lang))
+    elif verb == "slang":
+        await _safe_edit(query, *_screen_slang(stream, lang))
+    elif verb == "pause":
+        store.update_stream_status(sid_int, "paused")
+        await _safe_edit(query, *_screen_stream(store.get_stream(sid_int), lang))
+    elif verb == "resume":
+        store.update_stream_status(sid_int, "active")
+        store.record_send_result(sid_int, ok=True)   # clear auto-pause streak
+        await _safe_edit(query, *_screen_stream(store.get_stream(sid_int), lang))
+    elif verb == "addsrc":
+        if _source_cap_reached(user_id, sid_int):
+            await query.edit_message_text(
+                t(lang, "limit_sources", max=config.MAX_SOURCES_PER_STREAM))
+            return
+        context.user_data["addsrc_stream"] = sid_int
+        await query.edit_message_text(t(lang, "addsrc_prompt"), parse_mode="HTML")
+    elif verb == "research":
+        allowed, why = _research_allowed(user_id)
+        if not allowed:
+            await query.edit_message_text(why)
+            return
+        _kick_reresearch(user_id, stream, query.message.chat_id, context)
+        await _safe_edit(query, *_screen_stream(store.get_stream(sid_int), lang))
+    elif verb == "delstream":
+        rows = [[_btn(t(lang, "btn_delete_yes"), f"del_stream:{sid_int}"),
+                 _btn(t(lang, "btn_delete_keep"), f"menu:stream:{sid_int}")]]
+        n = len(store.get_sources_by_stream(sid_int))
+        await _safe_edit(query,
+                         t(lang, "delete_confirm",
+                           name=html_mod.escape(stream["name"]), n=n),
+                         InlineKeyboardMarkup(rows))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -97,7 +353,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_newstream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start the natural intake conversation, in the user's interface language."""
+    """Start the natural intake conversation, in the user's interface language.
+
+    Reachable as a command AND as the menu's "New stream" button — when it's the
+    button, clear its loading spinner first.
+    """
+    if update.callback_query is not None:
+        await update.callback_query.answer()
     opener = t(_lang(update.effective_user.id), "interview_opener")
     context.user_data["transcript"] = [{"role": "assistant", "content": opener}]
 
@@ -697,13 +959,24 @@ async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await send_rich_async(chat_id, t(lang, "not_your_stream"))
         return
 
-    if not _is_admin(update.effective_user.id) and \
-            len(store.get_sources_by_stream(stream_id)) >= config.MAX_SOURCES_PER_STREAM:
+    if _source_cap_reached(update.effective_user.id, stream_id):
         await send_rich_async(
             chat_id, t(lang, "limit_sources", max=config.MAX_SOURCES_PER_STREAM))
         return
 
-    url = context.args[1]
+    await _discover_and_add(chat_id, stream_id, context.args[1], lang, context)
+
+
+def _source_cap_reached(user_id: int, stream_id: int) -> bool:
+    return (not _is_admin(user_id)
+            and len(store.get_sources_by_stream(stream_id))
+            >= config.MAX_SOURCES_PER_STREAM)
+
+
+async def _discover_and_add(chat_id: int, stream_id: int, raw_url: str,
+                            lang: str, context) -> None:
+    """Find a site's news page and add it (shared by /addsource and the menu)."""
+    url = raw_url.strip()
     if "://" not in url:
         url = f"https://{url}"
 
@@ -711,9 +984,9 @@ async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         candidates = await find_news_pages(url)
-    except Exception as e:
+    except Exception:
         logger.exception("Feed discovery failed for %s", url)
-        await send_rich_async(chat_id, t(lang, "addsource_inspect_error", e=e))
+        await send_rich_async(chat_id, t(lang, "addsource_inspect_error"))
         return
 
     # ── Nothing publishable ───────────────────────────────────────────
@@ -759,6 +1032,37 @@ async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def handle_pending_source(update: Update,
+                                context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A plain message after tapping “Add source” in the menu is the site URL.
+
+    Only acts when the menu armed it (addsrc_stream set); otherwise ignores the
+    message so ordinary chatter isn't captured.
+    """
+    stream_id = context.user_data.get("addsrc_stream")
+    if not stream_id:
+        return
+    context.user_data.pop("addsrc_stream", None)
+    chat_id = update.effective_chat.id
+    lang = _lang(update.effective_user.id)
+    text = (update.message.text or "").strip()
+
+    owns, stream = await _owns_stream(update.effective_user.id, stream_id)
+    if stream is None or not owns:
+        await send_rich_async(chat_id, t(lang, "not_your_stream"))
+        return
+    if _source_cap_reached(update.effective_user.id, stream_id):
+        await send_rich_async(
+            chat_id, t(lang, "limit_sources", max=config.MAX_SOURCES_PER_STREAM))
+        return
+    # A sanity check so a stray sentence isn't treated as a site.
+    if not text or " " in text or "." not in text:
+        await send_rich_async(chat_id, t(lang, "addsrc_not_a_url"))
+        return
+
+    await _discover_and_add(chat_id, stream_id, text, lang, context)
+
+
 def _short(url: str, n: int = 34) -> str:
     trimmed = url.replace("https://", "").replace("http://", "").rstrip("/")
     return trimmed if len(trimmed) <= n else trimmed[: n - 1] + "…"
@@ -794,7 +1098,7 @@ async def _store_discovered_source(chat_id: int, stream_id: int, site_url: str,
         logger.exception("Embedding a manually-added source failed (non-fatal)")
 
     await send_rich_async(chat_id, t(
-        lang, "source_added", source_id=source_id, site=site_url,
+        lang, "source_added", name=name, site=site_url,
         poll=cand.url, kind=t(lang, kind_key), n=cand.item_count))
 
 
@@ -861,13 +1165,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     chat_id = query.message.chat_id
     lang = _lang(user_id)
 
+    # ── Menu navigation (edits the same message so Back always works) ──
+    if data.startswith("menu:"):
+        await _handle_menu_nav(query, context, user_id, lang, data[len("menu:"):])
+        return
+
+    # ── Remove a source from the menu's Sources screen ────────────────
+    if data.startswith("msrc_del:"):
+        _, sid, source_id = data.split(":", 2)
+        owns, stream = await _owns_stream(user_id, int(sid))
+        if stream is None or not owns:
+            await query.edit_message_text(t(lang, "not_your_stream"))
+            return
+        store.unsubscribe(int(sid), int(source_id))
+        text, kb = _screen_sources(stream, lang)
+        await _safe_edit(query, text, kb)
+        return
+
+    # ── Set quiet hours from the menu ─────────────────────────────────
+    if data.startswith("mquiet:"):
+        _, sid, spec = data.split(":", 2)
+        owns, stream = await _owns_stream(user_id, int(sid))
+        if stream is None or not owns:
+            await query.edit_message_text(t(lang, "not_your_stream"))
+            return
+        store.set_stream_criteria_field(
+            int(sid), "quiet_hours", "" if spec == "off" else spec)
+        stream = store.get_stream(int(sid))          # reflect the change
+        text, kb = _screen_stream(stream, lang)
+        await _safe_edit(query, text, kb)
+        return
+
     # ── Interface language ────────────────────────────────────────────
     if data.startswith("ulang:"):
         choice = data.split(":", 1)[1]
         if choice in ("en", "ru"):
             store.set_ui_lang(user_id, choice)
-            # Confirm in the language they just chose, not the old one.
-            await query.edit_message_text(t(choice, "lang_ui_set"))
+            # Re-render the menu in the language they just chose.
+            await _safe_edit(query, *_screen_main(choice))
         return
 
     # ── A stream's post language ──────────────────────────────────────
@@ -879,9 +1214,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         if choice in ("en", "ru"):
             store.set_stream_criteria_field(int(sid), "post_language", choice)
-            await query.edit_message_text(
-                t(lang, "lang_stream_set", name=stream["name"],
-                  language=t(lang, f"lang_name_{choice}")))
+            await _safe_edit(query, *_screen_stream(store.get_stream(int(sid)), lang))
         return
 
     # ── Delete a source ───────────────────────────────────────────────
@@ -935,8 +1268,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text(t(lang, "not_your_stream"))
             return
         store.set_post_length(int(sid), length)
-        key = "plen_set_standard" if length == "standard" else "plen_set_compact"
-        await query.edit_message_text(t(lang, key))
+        await _safe_edit(query, *_screen_stream(store.get_stream(int(sid)), lang))
         return
 
     # ── Re-test a source ──────────────────────────────────────────────
@@ -1071,11 +1403,17 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await send_rich_async(update.effective_chat.id, why)
         return
 
-    store.update_stream_status(stream_id, "researching")
     await send_rich_async(update.effective_chat.id,
                           t(lang, "research_rerun", stream_id=stream_id))
+    _kick_reresearch(update.effective_user.id, stream,
+                     update.effective_chat.id, context)
+    await send_rich_async(update.effective_chat.id, t(lang, "research_started"))
 
-    chat_id = update.effective_chat.id
+
+def _kick_reresearch(user_id: int, stream: dict, chat_id: int, context) -> None:
+    """Re-run source research for a stream (shared by /research and the menu)."""
+    stream_id = stream["id"]
+    store.update_stream_status(stream_id, "researching")
 
     # Rebuild the research input from the user's ORIGINAL intake conversation
     # when we have it. criteria is a generated profile after the first run —
@@ -1091,10 +1429,7 @@ async def cmd_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         answers = criteria  # legacy stream from before intake preservation
 
     asyncio.create_task(_run_research_background(
-        stream_id, answers, chat_id, context,
-        user_id=update.effective_user.id))
-
-    await send_rich_async(update.effective_chat.id, t(lang, "research_started"))
+        stream_id, answers, chat_id, context, user_id=user_id))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

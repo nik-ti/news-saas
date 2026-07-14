@@ -21,6 +21,8 @@ from database.models import init_db
 from bot.handlers import (
     # Commands
     cmd_start,
+    cmd_help,
+    cmd_menu,
     cmd_newstream,
     cmd_streams,
     cmd_sources,
@@ -41,6 +43,7 @@ from bot.handlers import (
     # Conversation handler (single natural interview loop)
     handle_interview,
     cancel_conversation,
+    handle_pending_source,
     INTERVIEW,
     # Inline button router
     handle_callback,
@@ -165,6 +168,43 @@ async def _post_shutdown(app: Application) -> None:
     await shutdown_crawler()
 
 
+# The commands Telegram shows in the "/" hint list and the chat Menu button.
+# Localized so Russian clients see Russian descriptions.
+_MENU_COMMANDS = {
+    "en": [
+        ("newstream", "Set up a news stream"),
+        ("menu", "Open the button menu"),
+        ("streams", "My streams"),
+        ("latest", "Latest articles"),
+        ("language", "Bot / post language"),
+        ("help", "All commands"),
+    ],
+    "ru": [
+        ("newstream", "Создать новостной поток"),
+        ("menu", "Открыть меню с кнопками"),
+        ("streams", "Мои потоки"),
+        ("latest", "Последние статьи"),
+        ("language", "Язык бота и постов"),
+        ("help", "Все команды"),
+    ],
+}
+
+
+async def _post_init(app: Application) -> None:
+    """Register the native command menu (the '/' list + Menu button)."""
+    from telegram import BotCommand, MenuButtonCommands
+    try:
+        await app.bot.set_my_commands(
+            [BotCommand(c, d) for c, d in _MENU_COMMANDS["en"]])
+        await app.bot.set_my_commands(
+            [BotCommand(c, d) for c, d in _MENU_COMMANDS["ru"]],
+            language_code="ru")
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+        logger.info("Registered bot command menu (en, ru)")
+    except Exception:
+        logger.exception("Setting the command menu failed (non-fatal)")
+
+
 def build_application() -> Application:
     """Build and configure the Telegram bot application."""
     # §3.10: user_data (the running interview transcript) survives restarts —
@@ -177,12 +217,18 @@ def build_application() -> Application:
     app = (Application.builder()
            .token(config.TELEGRAM_BOT_TOKEN)
            .persistence(persistence)
+           .post_init(_post_init)
            .post_shutdown(_post_shutdown)
            .build())
 
     # ── Conversation handler for /newstream ───────────────────────────────
+    # The menu's "New stream" button is a second entry point, so the button
+    # starts the same interview the command does.
     newstream_conv = ConversationHandler(
-        entry_points=[CommandHandler("newstream", cmd_newstream)],
+        entry_points=[
+            CommandHandler("newstream", cmd_newstream),
+            CallbackQueryHandler(cmd_newstream, pattern="^menu:newstream$"),
+        ],
         states={
             INTERVIEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interview)],
         },
@@ -198,6 +244,8 @@ def build_application() -> Application:
 
     # ── Register all command handlers ─────────────────────────────────────
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(newstream_conv)
     app.add_handler(CommandHandler("streams", cmd_streams))
     app.add_handler(CommandHandler("sources", cmd_sources))
@@ -215,6 +263,11 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("resumestream", cmd_resumestream))
     app.add_handler(CommandHandler("deletestream", cmd_deletestream))
     app.add_handler(CommandHandler("quiet", cmd_quiet))
+    # A plain message after tapping the menu's "Add source" is the site URL.
+    # Registered after the interview conversation so it only fires when no
+    # conversation is active; it no-ops unless the menu armed it.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                   handle_pending_source))
     # Inline keyboards are inert without this.
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(error_handler)
