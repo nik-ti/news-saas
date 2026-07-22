@@ -35,12 +35,21 @@ Self-serve news service: user describes a topic → AI research engine finds the
 - Polite: sequential verification, 1s delay, one retry on a bot challenge, gives up on hostile hosts
 - Never re-crawls the homepage it already fetched
 
-### News Cycle (one cron, every 30 min)
-- Phase A — snapshot each source; **a source's first poll is a silent baseline** (records everything, sends nothing)
-- Phase B — summarize → binary relevance gate (per-stream rubric) → write post → send to the stream's owner
-- Caps: 3 new articles per source per cycle, 10 posts per cycle globally
+### News Cycle (two decoupled jobs: poll tick + send tick)
+- **Poll tick** (every 10 min) — snapshot each due source in the current slot;
+  browser sources are hash-slotted (`id % 3`) so each is still crawled only every
+  ~30 min, but discoveries spread across the half hour. RSS bypasses slotting —
+  a conditional GET usually costs one 304. **A source's first poll is a silent
+  baseline** (records everything, sends nothing)
+- **Send tick** (every 5 min) — summarize → binary relevance gate (per-stream
+  rubric) → write post → send to the stream's owner. Posts trickle in instead of
+  arriving in one 30-min clump; a slow crawl never delays delivery (separate locks)
+- Caps: 3 new articles per source per poll, 2 posts per stream per send tick,
+  5 posts per tick globally
 - 3-strategy article extraction: RSS feeds → link extraction → LLM inline extraction
 - Transient failures (LLM outage, network) retry up to 3 times; permanent ones (Telegram 400/403) are terminal
+- Truncation guard: a cut LLM completion (`finish_reason: length`) is retried
+  once, then held for the next tick — a post that ends mid-sentence is never sent
 - Computed summaries are persisted, so a retry costs one LLM call, not a re-crawl
 - Overlap guard: a slow cycle causes the next tick to skip
 - Circuit breaker: if most sources fail in one cycle (dead browser, outage), nobody's
@@ -51,12 +60,16 @@ Self-serve news service: user describes a topic → AI research engine finds the
 
 ### Telegram Bot
 - `/newstream` — natural interview → AI research → sources found
+- 🎯 Tune stream (menu) — refine a stream in plain language: "stop sending
+  news about X" becomes an atomic rule on the relevance gate, confirmed with a
+  ✅ tap before anything is saved; off-topic requests are declined with a
+  suggestion to start a separate stream
 - `/streams`, `/sources`, `/sources_all` — view streams and sources
 - `/addsource` — discovers the site's news page(s); asks if there are several
 - `/deletesource`, `/testsource` — manual source management (ownership-checked)
 - `/research` — re-run research for a stream, regenerating profile + rubric (ownership-checked)
 - `/latest` — show the caller's latest articles (tenant-scoped)
-- `/runpipeline` — manually run the same news cycle the cron runs
+- `/runpipeline` — manually run a full poll (all slots) + one send pass
 - `/status` — system stats, including sources awaiting baseline
 - Authorization: `/sources_all`, `/runpipeline`, `/status`, `/testsource` are
   admin-only (`ADMIN_USER_ID`); every stream-taking command checks ownership
@@ -276,6 +289,58 @@ Actions CI running the offline suite on every push.
 **Verified:** 118 tests green; live migration + boot clean; startup self-check OK;
 first post-deploy news cycle ran against real sources without errors.
 DB backup at `data/news.db.pre-v2-backup`.
+
+---
+
+### Jul 22, 2026 — Paced delivery, staggered polling, truncation guard
+
+Three changes from `PLAN.md` (Parts 0–2), prompted by a user receiving a post
+cut off mid-sentence and by the "30 min of silence, then a clump" delivery
+rhythm.
+
+**Truncated-post fix.** The broken NIGHT-token post traced to the provider
+cutting the post-writer's completion (`finish_reason: length`) — LangChain
+returns partial text without raising, so it shipped as-is. Now `chat()` checks
+`finish_reason` (string and nested-dict shapes), retries a truncated completion
+once, then raises into the caller's normal retry path; the post writer got an
+explicit `max_tokens=1024` and a belt-and-braces check that the body ends with
+sentence punctuation, otherwise it returns "" and the delivery is retried next
+tick instead of posting garbage.
+
+**Paced sending.** Phase B is no longer chained to the poll: a second JobQueue
+job drains the queue every 5 min, max 2 posts per stream and 5 global per tick
+(`MAX_POSTS_PER_STREAM_PER_TICK`, `MAX_POSTS_PER_TICK`). Same news, trickling in
+like a live feed; transient-failure retries now land in 5 min instead of 30.
+The send phase has its own lock so a slow crawl never blocks delivery.
+
+**Staggered polling.** The poll tick runs every 10 min and browser sources are
+hash-slotted (`id % POLL_SLOTS`), so each source keeps its ~30-min cadence but
+discoveries — and Chromium load — spread across the half hour. RSS sources
+deliberately bypass slotting (conditional GETs are near-free and fresher RSS is
+a win). `/runpipeline` forces all slots + one send pass.
+
+**Verified:** 186 tests green (new: truncation guard, per-tick budgets, clump
+draining oldest-first, slot gate, deterministic slot clock, poll-only cycle).
+
+**Tune stream (Part 3, same day).** Users can now refine a stream in natural
+language from the menu: "stop sending news about the Ukraine-Russia war" is
+interpreted into an atomic structured rule (`{kind: exclude|include, text}`,
+in `streams.criteria.rules`), and CODE renders the rules into the relevance
+gate's prompt as a fixed "Hard user rules" block (`relevance_checker`) — the
+LLM never edits rubric prose, so the gate prompt can't rot as requests pile
+up. Nothing is written without a ✅ confirmation tap; duplicates are detected
+(interpreter flags `matched_rule_id`, the store reactivates rather than
+duplicates); rules are soft-deleted from the same screen; cap of 20 active
+rules per stream. The interpreter doubles as the topic guardian: a request
+that would broaden the stream beyond its beat comes back `off_topic` and the
+bot suggests a separate `/newstream` instead. Replies are i18n templates
+(en/ru), not LLM prose — deterministic and localised. The old catch-all text
+handler is now `handle_free_text`, routing by whichever state the menu armed
+(add-source URL or tune request).
+
+**Verified:** 203 tests green (new: rules rendering into the gate, interpreter
+contract incl. fail-safe unclear, store lifecycle/reactivation, full bot flow
+— arm → request → confirm ✅/❌, duplicate, cap, off-topic, remove).
 
 ---
 

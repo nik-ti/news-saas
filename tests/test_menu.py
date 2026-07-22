@@ -138,7 +138,7 @@ async def test_add_source_flow_arms_and_consumes_message(temp_db, monkeypatch):
         effective_user=SimpleNamespace(id=1),
         effective_chat=SimpleNamespace(id=1),
         message=SimpleNamespace(text="techcrunch.com"))
-    await handlers.handle_pending_source(upd, ctx)
+    await handlers.handle_free_text(upd, ctx)
 
     assert called["args"] == (sid, "techcrunch.com")
     assert "addsrc_stream" not in ctx.user_data       # flag consumed
@@ -156,7 +156,7 @@ async def test_pending_source_ignores_unarmed_messages(temp_db, monkeypatch):
         effective_user=SimpleNamespace(id=1),
         effective_chat=SimpleNamespace(id=1),
         message=SimpleNamespace(text="just chatting"))
-    await handlers.handle_pending_source(upd, SimpleNamespace(user_data={}))
+    await handlers.handle_free_text(upd, SimpleNamespace(user_data={}))
     assert "hit" not in called
 
 
@@ -179,7 +179,7 @@ async def test_add_source_rejects_non_url_text(temp_db, monkeypatch):
         effective_user=SimpleNamespace(id=1),
         effective_chat=SimpleNamespace(id=1),
         message=SimpleNamespace(text="please add some tech news"))
-    await handlers.handle_pending_source(upd, ctx)
+    await handlers.handle_free_text(upd, ctx)
     assert "hit" not in called
     assert sent and sent[0] == t("en", "addsrc_not_a_url")
 

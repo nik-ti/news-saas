@@ -632,6 +632,84 @@ Everything here is also available as buttons — just send `/menu`.
         "ru": "# 📰 Последние статьи\n\n| # | Заголовок | Источник | Релевантность |\n"
               "|---|-----------|----------|---------------|\n",
     },
+
+    # ── tune stream (natural-language rules) ──────────────────────────────
+    "btn_tune_stream": {"en": "🎯 Tune stream", "ru": "🎯 Настроить поток"},
+    "menu_tune_title": {
+        "en": "🎯 <b>Tune “{name}”</b>\n\n"
+              "Tell me in your own words what to change — what to stop sending, "
+              "what to catch more of. Just type it as a message.\n\n"
+              "<b>Current rules:</b>\n{rules}",
+        "ru": "🎯 <b>Настройка «{name}»</b>\n\n"
+              "Напишите своими словами, что изменить — что перестать присылать, "
+              "чего присылать больше. Просто отправьте сообщением.\n\n"
+              "<b>Текущие правила:</b>\n{rules}",
+    },
+    "tune_rules_none": {
+        "en": "<i>— none yet —</i>",
+        "ru": "<i>— пока нет —</i>",
+    },
+    "tune_rule_line": {
+        "en": "#{rid} {icon} {text}",
+        "ru": "#{rid} {icon} {text}",
+    },
+    "tune_confirm_exclude": {
+        "en": "Got it: <b>never send</b> news about <b>{text}</b> "
+              "for <b>{name}</b>. Save this rule?",
+        "ru": "Понял: <b>не присылать</b> новости про <b>{text}</b> "
+              "для потока <b>{name}</b>. Сохранить правило?",
+    },
+    "tune_confirm_include": {
+        "en": "Got it: <b>always send</b> news about <b>{text}</b> "
+              "for <b>{name}</b>. Save this rule?",
+        "ru": "Понял: <b>всегда присылать</b> новости про <b>{text}</b> "
+              "для потока <b>{name}</b>. Сохранить правило?",
+    },
+    "tune_confirm_remove": {
+        "en": "Remove the rule <b>{text}</b> from <b>{name}</b>?",
+        "ru": "Убрать правило <b>{text}</b> из потока <b>{name}</b>?",
+    },
+    "btn_rule_yes": {"en": "✅ Save", "ru": "✅ Сохранить"},
+    "btn_rule_del": {"en": "🗑 Remove", "ru": "🗑 Убрать"},
+    "tune_saved": {
+        "en": "✅ Rule saved for <b>{name}</b> — it applies from the next "
+              "article check.",
+        "ru": "✅ Правило сохранено для <b>{name}</b> — работает со следующей "
+              "проверки статей.",
+    },
+    "tune_removed": {
+        "en": "🗑 Rule removed from <b>{name}</b>.",
+        "ru": "🗑 Правило убрано из потока <b>{name}</b>.",
+    },
+    "tune_already": {
+        "en": "That's already covered by one of this stream's rules.",
+        "ru": "Это уже покрыто одним из правил потока.",
+    },
+    "tune_cap": {
+        "en": "This stream already has {max} rules — that's the cap. Remove "
+              "one first (tap 🗑 next to it in the Tune screen).",
+        "ru": "В потоке уже {max} правил — это максимум. Сначала уберите одно "
+              "(кнопка 🗑 рядом с ним на экране настройки).",
+    },
+    "tune_offtopic": {
+        "en": "That sounds like a different beat from <b>{name}</b>. Mixing "
+              "topics in one stream blurs the filter — better to start a "
+              "separate stream for it with /newstream.",
+        "ru": "Похоже, это другая тема, не из области потока <b>{name}</b>. "
+              "Смешивать темы в одном потоке — значит размыть фильтр. Лучше "
+              "создайте отдельный поток через /newstream.",
+    },
+    "tune_unclear": {
+        "en": "I couldn't turn that into a clear rule. Try something like "
+              "<i>“stop sending news about X”</i> or <i>“more news about Y”</i>.",
+        "ru": "Не смог превратить это в чёткое правило. Попробуйте так: "
+              "<i>«перестань присылать новости про X»</i> или <i>«больше "
+              "новостей про Y»</i>.",
+    },
+    "tune_cancelled": {
+        "en": "Cancelled — no rules changed.",
+        "ru": "Отменено — правила не изменились.",
+    },
 }
 
 

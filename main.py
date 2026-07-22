@@ -43,7 +43,7 @@ from bot.handlers import (
     # Conversation handler (single natural interview loop)
     handle_interview,
     cancel_conversation,
-    handle_pending_source,
+    handle_free_text,
     INTERVIEW,
     # Inline button router
     handle_callback,
@@ -67,17 +67,31 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def cron_news_cycle(context):
-    """The one cron: poll sources → gate → post."""
+    """Poll tick: snapshot this slot's sources and queue fresh articles."""
     from pipeline.news_cycle import run_news_cycle
-    logger.info("CRON: News cycle running...")
+    logger.info("CRON: Poll tick running...")
     try:
         result = await run_news_cycle()
         if result.get("skipped"):
             return
-        logger.info("CRON: News cycle done — posted %d of %d candidates",
+        logger.info("CRON: Poll tick done — queued %d, baselined %d",
+                    result["queued"], result["baselined_sources"])
+    except Exception:
+        logger.exception("CRON poll tick error")
+
+
+async def cron_send_phase(context):
+    """Send tick: drain a slice of the deliveries queue (paced sending)."""
+    from pipeline.news_cycle import run_send_phase
+    logger.info("CRON: Send tick running...")
+    try:
+        result = await run_send_phase()
+        if result.get("skipped"):
+            return
+        logger.info("CRON: Send tick done — posted %d of %d candidates",
                     result["posted"], result["candidates"])
     except Exception:
-        logger.exception("CRON news cycle error")
+        logger.exception("CRON send tick error")
 
 
 async def cron_health_check(context):
@@ -263,11 +277,11 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("resumestream", cmd_resumestream))
     app.add_handler(CommandHandler("deletestream", cmd_deletestream))
     app.add_handler(CommandHandler("quiet", cmd_quiet))
-    # A plain message after tapping the menu's "Add source" is the site URL.
-    # Registered after the interview conversation so it only fires when no
-    # conversation is active; it no-ops unless the menu armed it.
+    # A plain message is routed by whatever the menu armed (add source URL,
+    # tune-stream request). Registered after the interview conversation so it
+    # only fires when no conversation is active; it no-ops otherwise.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
-                                   handle_pending_source))
+                                   handle_free_text))
     # Inline keyboards are inert without this.
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(error_handler)
@@ -286,12 +300,23 @@ def setup_scheduler(app: Application) -> None:
                        "Install with: pip install 'python-telegram-bot[job-queue]'")
         return
 
-    # The one news cycle: poll sources → gate → post
+    # Poll tick: snapshot this slot's sources and queue fresh articles.
+    # Each source is hash-slotted (id % POLL_SLOTS), so per-source cadence
+    # stays ~POLL_TICK_MINUTES * POLL_SLOTS minutes.
     job_queue.run_repeating(
         cron_news_cycle,
-        interval=config.NEWS_CYCLE_MINUTES * 60,
+        interval=config.POLL_TICK_MINUTES * 60,
         first=120,  # let the bot settle before the first poll
         name="news_cycle",
+    )
+
+    # Send tick: drain the queue little and often — posts trickle in instead
+    # of arriving in one half-hourly clump.
+    job_queue.run_repeating(
+        cron_send_phase,
+        interval=config.SEND_TICK_MINUTES * 60,
+        first=60,
+        name="send_phase",
     )
 
     # Health check every 24 hours
@@ -325,9 +350,12 @@ def setup_scheduler(app: Application) -> None:
     # One-shot dependency self-check shortly after boot
     job_queue.run_once(startup_selfcheck, when=15, name="startup_selfcheck")
 
-    logger.info("Scheduler configured: news_cycle=%dmin (max %d/source, %d posts/cycle), health=%dh",
-                config.NEWS_CYCLE_MINUTES, config.MAX_NEW_PER_SOURCE,
-                config.MAX_POSTS_PER_CYCLE, config.HEALTH_CHECK_INTERVAL_HOURS)
+    logger.info("Scheduler configured: poll=%dmin x%d slots (max %d/source), "
+                "send=%dmin (max %d/stream, %d/tick), health=%dh",
+                config.POLL_TICK_MINUTES, config.POLL_SLOTS,
+                config.MAX_NEW_PER_SOURCE, config.SEND_TICK_MINUTES,
+                config.MAX_POSTS_PER_STREAM_PER_TICK, config.MAX_POSTS_PER_TICK,
+                config.HEALTH_CHECK_INTERVAL_HOURS)
 
 
 def main():
@@ -360,7 +388,10 @@ def main():
 
 The research engine and news cycle are running.
 
-I check every source's article list every **{config.NEWS_CYCLE_MINUTES} minutes**. \
+I check every source's article list roughly every **{config.POLL_TICK_MINUTES * config.POLL_SLOTS} minutes** \
+(poll tick {config.POLL_TICK_MINUTES} min, sources staggered across {config.POLL_SLOTS} slots), \
+and deliver queued posts every **{config.SEND_TICK_MINUTES} minutes** so news \
+trickles in instead of arriving in one batch. \
 A newly added source is baselined on its first check — I record what's already \
 published and only send you what appears *after* that.
 

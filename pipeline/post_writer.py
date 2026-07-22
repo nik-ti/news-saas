@@ -122,6 +122,10 @@ MiCA (Markets in Crypto-Assets) is the EU's unified crypto framework, phased in 
 **Output:** A short Telegram news post, HTML format, {language_rule}."""
 
 
+# Sentence-ending characters the post body must finish on. ">" covers a body
+# ending on a closing HTML tag (e.g. a bolded number as the last token).
+_SENTENCE_ENDS = (".", "!", "?", '"', "”", ")", ">")
+
 # The one line that changes with the user's chosen post length.
 _LENGTH_RULES = {
     "standard": "80-100 words. Give the reader the full picture — the what, "
@@ -191,6 +195,14 @@ async def write_post(summary_text: str, title: str = "", source_url: str = "",
 
     post = _strip_preamble(_strip_code_blocks(raw))
     if not post:
+        return ""
+
+    # Belt-and-braces truncation guard (the llm.py finish_reason check is the
+    # primary one): a cut completion ends mid-sentence. Returning "" sends the
+    # delivery down the same retry path as an empty completion.
+    if not post.rstrip().endswith(_SENTENCE_ENDS):
+        logger.warning("Post body ends mid-sentence — treating as truncated, "
+                       "holding for retry")
         return ""
 
     if source_url:

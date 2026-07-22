@@ -27,8 +27,37 @@ a missed article costs less than a wasted notification.
 Return ONLY this JSON object, nothing else:
 {"is_relevant": true or false, "reason": "<one short sentence>"}"""
 
+HARD_RULES_HEADER = "## Hard user rules (override everything above)"
 
-def _rubric_for(profile: dict) -> str:
+
+def _rules_section(profile: dict) -> str:
+    """
+    Render the stream's user-tuning rules as a fixed-format block appended to
+    the rubric. Rules are atomic one-liners written via the bot's tune flow;
+    the LLM never edits prose — this rendering is pure string joining, so the
+    gate prompt can't rot no matter how the requests were phrased.
+    """
+    if not isinstance(profile, dict):
+        return ""
+    rules = profile.get("rules") or []
+    excludes = [str(r["text"]) for r in rules
+                if r.get("active") and r.get("kind") == "exclude" and r.get("text")]
+    includes = [str(r["text"]) for r in rules
+                if r.get("active") and r.get("kind") == "include" and r.get("text")]
+    if not excludes and not includes:
+        return ""
+    lines = ["", HARD_RULES_HEADER]
+    if excludes:
+        lines.append("NEVER send articles about: " + "; ".join(excludes) +
+                     " — even when the article otherwise fits the rubric.")
+    if includes:
+        lines.append("ALWAYS send articles about: " + "; ".join(includes) +
+                     " — when the article genuinely covers one of these, send "
+                     "it even if otherwise borderline.")
+    return "\n".join(lines)
+
+
+def _base_rubric_for(profile: dict) -> str:
     """
     Resolve the rubric body for a stream profile.
 
@@ -69,6 +98,11 @@ def _rubric_for(profile: dict) -> str:
         )
 
     return "Send the article only if it is clearly newsworthy and on-topic."
+
+
+def _rubric_for(profile: dict) -> str:
+    """The base rubric plus the stream's hard user rules (if any)."""
+    return _base_rubric_for(profile) + _rules_section(profile)
 
 
 async def check_relevance(title: str, summary: str, profile: dict) -> tuple[bool, str]:

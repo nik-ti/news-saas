@@ -39,15 +39,25 @@ ARTICLES_TO_EXAMINE = 3          # articles to fetch per candidate source (deep 
 MAX_CONSECUTIVE_FETCH_FAILURES = 3  # deactivate a source only after N failed cycles
 
 # ── Pipeline / Cron ───────────────────────────────────────────────────────────
-NEWS_CYCLE_MINUTES = 30          # the one cron: poll sources → gate → post
-MAX_NEW_PER_SOURCE = 3           # new articles queued per source per cycle
-MAX_POSTS_PER_CYCLE = 30         # global safety ceiling on messages per cycle
-MAX_POSTS_PER_STREAM_PER_CYCLE = 5  # per-stream budget — one noisy stream can't
-                                    # starve every other tenant anymore
+# Two PTB jobs, decoupled: a poll tick (discovery) and a faster send tick
+# (delivery), so posts trickle in instead of arriving in one 30-min clump.
+POLL_TICK_MINUTES = 10         # how often the poll job fires
+POLL_SLOTS = 3                 # sources hash-slot by id (id % POLL_SLOTS) — each
+                               # is still polled every ~POLL_TICK_MINUTES*POLL_SLOTS min
+SEND_TICK_MINUTES = 5          # how often the send job drains the queue
+MAX_NEW_PER_SOURCE = 3         # new articles queued per source per poll
+MAX_POSTS_PER_TICK = 5         # global safety ceiling on messages per send tick
+MAX_POSTS_PER_STREAM_PER_TICK = 2  # per-stream budget per send tick — a noisy
+                                   # stream trickles instead of clumping
 MAX_ARTICLE_ATTEMPTS = 3         # transient failures before an article is dropped
 HEALTH_CHECK_INTERVAL_HOURS = 24
 RETENTION_DAYS = 30              # nightly prune of dead article rows
 AUTO_PAUSE_SEND_FAILURES = 3     # consecutive terminal send failures → stream paused
+
+# Stream tuning (bot "Tune stream" flow): atomic user rules rendered into the
+# relevance gate's prompt. Capped so the gate prompt stays short — past this,
+# the user is asked to remove or merge rules first.
+MAX_STREAM_RULES = 20
 
 # Polling tiers (§2.6): non-RSS sources whose proven publishing frequency is low
 # skip ticks. Hours a source must wait between browser crawls, by frequency.

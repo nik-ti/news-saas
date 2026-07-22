@@ -148,7 +148,8 @@ async def test_auto_pause_after_repeated_send_failures(temp_db, monkeypatch):
         return {"ok": True}
     monkeypatch.setattr(nc, "send_rich_async", fake_admin)
 
-    await nc._post_phase()
+    await nc._post_phase()                               # tick 1: 2 failures
+    await nc._post_phase()                               # tick 2: 3rd failure
     stream = store.get_stream(sid)
     assert stream["status"] == "paused"
     assert any("auto-paused" in md for _, md in admin_notes)
@@ -191,7 +192,7 @@ def test_quiet_hours_parser():
 
 async def test_per_stream_budget_stops_starvation(temp_db, monkeypatch):
     # One noisy stream with 10 queued items, one quiet stream with 1 —
-    # the quiet stream must still get its post in the same cycle.
+    # the quiet stream must still get its post in the same send tick.
     noisy = store.create_stream(user_id=1, name="noisy", criteria={"topic": "x"})
     src_n = store.add_source(stream_id=noisy, url="https://n.com")
     for i in range(10):
@@ -205,7 +206,8 @@ async def test_per_stream_budget_stops_starvation(temp_db, monkeypatch):
     store.create_delivery(aid_q, quiet)
 
     sent = _stub_pipeline(monkeypatch)
-    monkeypatch.setattr(config, "MAX_POSTS_PER_STREAM_PER_CYCLE", 5)
+    monkeypatch.setattr(config, "MAX_POSTS_PER_STREAM_PER_TICK", 5)
+    monkeypatch.setattr(config, "MAX_POSTS_PER_TICK", 30)
 
     async def no_sleep(_):
         return None
@@ -214,6 +216,117 @@ async def test_per_stream_budget_stops_starvation(temp_db, monkeypatch):
     stats = await nc._post_phase()
     assert stats["posted"] == 6                        # 5 noisy + 1 quiet
     assert {m["chat_id"] for m in sent} == {1, 2}      # quiet user WAS served
+
+
+def _queued_count(stream_id):
+    conn = get_connection()
+    n = conn.execute(
+        "SELECT COUNT(*) AS c FROM deliveries WHERE stream_id = ? "
+        "AND status = 'new'", (stream_id,)).fetchone()["c"]
+    conn.close()
+    return n
+
+
+async def test_per_tick_budget_leaves_remainder_queued(temp_db, monkeypatch):
+    # 5 queued for one stream, per-tick cap 2: exactly 2 sent this tick,
+    # 3 stay 'new', and the next tick sends 2 more.
+    sid = store.create_stream(user_id=1, name="s", criteria={"topic": "x"})
+    src = store.add_source(stream_id=sid, url="https://s.com")
+    for i in range(5):
+        aid = store.add_article(source_id=src, title=f"t{i}", url=f"us{i}",
+                                content_hash=f"S{i}")
+        store.create_delivery(aid, sid)
+
+    sent = _stub_pipeline(monkeypatch)
+    monkeypatch.setattr(config, "MAX_POSTS_PER_STREAM_PER_TICK", 2)
+    monkeypatch.setattr(config, "MAX_POSTS_PER_TICK", 50)
+
+    stats1 = await nc._post_phase()
+    assert stats1["posted"] == 2
+    assert _queued_count(sid) == 3
+
+    stats2 = await nc._post_phase()
+    assert stats2["posted"] == 2
+    assert _queued_count(sid) == 1
+    assert len(sent) == 4
+
+
+async def test_clump_drains_over_ticks_oldest_first(temp_db, monkeypatch):
+    # A 6-article clump on one stream drains 2-per-tick over 3 ticks,
+    # oldest first (get_queued_deliveries ORDER BY a.fetched_at ASC).
+    sid = store.create_stream(user_id=1, name="s", criteria={"topic": "x"})
+    src = store.add_source(stream_id=sid, url="https://s.com")
+    aids = []
+    for i in range(6):
+        aid = store.add_article(source_id=src, title=f"t{i}", url=f"uc{i}",
+                                summary=f"MARKER{i}", content_hash=f"C{i}")
+        store.create_delivery(aid, sid)
+        aids.append(aid)
+    # fetched_at has second resolution — stagger explicitly so the
+    # oldest-first ordering is deterministic.
+    conn = get_connection()
+    for i, aid in enumerate(aids):
+        conn.execute("UPDATE articles SET fetched_at = ? WHERE id = ?",
+                     (f"2026-07-0{i + 1} 00:00:00", aid))
+    conn.commit(); conn.close()
+
+    async def fake_write(summ, title="", source_url="", length="standard",
+                         language=""):
+        return f"<b>Post</b> {summ} — long enough to pass the check."
+
+    async def fake_summarize(article):
+        # Trust the stored per-article summary so each post carries its marker.
+        return article.get("summary") or "", article.get("title") or ""
+
+    sent = _stub_pipeline(monkeypatch)
+    monkeypatch.setattr(nc, "write_post", fake_write)
+    monkeypatch.setattr(nc, "summarize_article", fake_summarize)
+    monkeypatch.setattr(config, "MAX_POSTS_PER_STREAM_PER_TICK", 2)
+    monkeypatch.setattr(config, "MAX_POSTS_PER_TICK", 50)
+
+    for tick in range(3):
+        stats = await nc._post_phase()
+        assert stats["posted"] == 2, f"tick {tick}"
+    markers = [m["html"].split()[1] for m in sent]
+    assert markers == [f"MARKER{i}" for i in range(6)]
+
+
+async def test_global_per_tick_ceiling_across_streams(temp_db, monkeypatch):
+    # 3 streams x 2 queued, global per-tick cap 3 → only 3 sent this tick.
+    for u in (1, 2, 3):
+        sid = store.create_stream(user_id=u, name=f"s{u}", criteria={"topic": "x"})
+        src = store.add_source(stream_id=sid, url=f"https://g{u}.com")
+        for i in range(2):
+            aid = store.add_article(source_id=src, title=f"t{i}",
+                                    url=f"ug{u}{i}", content_hash=f"G{u}{i}")
+            store.create_delivery(aid, sid)
+
+    _stub_pipeline(monkeypatch)
+    monkeypatch.setattr(config, "MAX_POSTS_PER_STREAM_PER_TICK", 2)
+    monkeypatch.setattr(config, "MAX_POSTS_PER_TICK", 3)
+
+    stats = await nc._post_phase()
+    assert stats["candidates"] == 3
+    assert stats["posted"] == 3
+
+
+async def test_run_news_cycle_is_poll_only(temp_db, monkeypatch):
+    # run_news_cycle polls and queues but NEVER sends — delivery is the
+    # separate run_send_phase tick's job.
+    aid, sid = _queued_delivery()
+    sent = _stub_pipeline(monkeypatch)
+
+    async def fake_snap(source):
+        return []
+    monkeypatch.setattr(nc, "snapshot_source", fake_snap)
+
+    result = await nc.run_news_cycle(force_all_slots=True)
+    assert result["skipped"] is False
+    assert sent == []                                  # nothing sent
+    assert _status(aid, sid)["status"] == "new"        # still queued
+
+    send = await nc.run_send_phase()
+    assert send["posted"] == 1                         # the send tick delivers
 
 
 async def test_retry_budget_exhaustion_marks_dropped(temp_db, monkeypatch):

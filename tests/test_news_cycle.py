@@ -273,3 +273,54 @@ def test_due_for_poll_tiers():
     never = {"fetch_method": "links", "pub_frequency": "weekly",
              "last_fetched": None}
     assert nc._due_for_poll(never, now) is True        # unbaselined: always due
+
+
+def test_due_for_poll_slot_gate():
+    # With the 10-min poll tick, browser sources are hash-slotted by id so
+    # each is still crawled only every ~POLL_TICK_MINUTES * POLL_SLOTS min.
+    daily = {"id": 6, "fetch_method": "links", "pub_frequency": "daily",
+             "last_fetched": "2026-07-13 01:59:00"}
+    assert daily["id"] % config.POLL_SLOTS == 0
+    assert nc._due_for_poll(daily, slot=0) is True     # its slot: due
+    assert nc._due_for_poll(daily, slot=1) is False    # not its slot: skipped
+    assert nc._due_for_poll(daily, slot=None) is True  # manual run: no gate
+
+    # RSS bypasses slotting — a conditional GET usually costs one 304.
+    rss = {"id": 6, "fetch_method": "rss", "pub_frequency": "daily",
+           "last_fetched": "2026-07-13 01:59:00"}
+    assert nc._due_for_poll(rss, slot=1) is True
+
+    # Tier gating still applies WITHIN the slot.
+    from datetime import datetime, timezone
+    now = datetime(2026, 7, 13, 2, 0, tzinfo=timezone.utc)
+    weekly_recent = {"id": 6, "fetch_method": "links", "pub_frequency": "weekly",
+                     "last_fetched": "2026-07-13 00:00:00"}
+    assert nc._due_for_poll(weekly_recent, now, slot=0) is False
+
+
+def test_current_slot_is_deterministic():
+    # Slot derives from wall clock: stable within a tick, cycles through all
+    # POLL_SLOTS buckets on successive ticks.
+    base = 1_752_000_000                               # fixed epoch
+    tick = config.POLL_TICK_MINUTES * 60
+    assert nc._current_slot(base) == nc._current_slot(base + tick - 1)
+    slots = {nc._current_slot(base + i * tick) for i in range(config.POLL_SLOTS)}
+    assert slots == set(range(config.POLL_SLOTS))
+    assert nc._current_slot(base + config.POLL_SLOTS * tick) == nc._current_slot(base)
+
+
+async def test_every_source_polled_once_across_slots(temp_db, monkeypatch):
+    # 3 daily sources, ids 1-3 → one slot each; over 3 ticks each is polled
+    # exactly once.
+    srcs = [_mk(1, f"https://s{i}.com")[1] for i in range(3)]
+    assert {s % config.POLL_SLOTS for s in srcs} == {0, 1, 2}
+
+    polls = []
+    async def fake_snap(source):
+        polls.append(source["id"])
+        return []
+    monkeypatch.setattr(nc, "snapshot_source", fake_snap)
+
+    for slot in range(config.POLL_SLOTS):
+        await nc._baseline_and_fetch_phase(slot=slot)
+    assert sorted(polls) == sorted(srcs)               # each exactly once

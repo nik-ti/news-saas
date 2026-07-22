@@ -25,9 +25,10 @@ from bot.messaging import send_rich_async
 from research.engine import run_research
 from research.feed_finder import find_news_pages
 from research.profile_builder import interview_turn, generate_stream_name
+from research.rule_interpreter import interpret_rule_request
 from crawler.fetcher import test_source
 from pipeline import usage
-from pipeline.news_cycle import run_news_cycle
+from pipeline.news_cycle import run_news_cycle, run_send_phase
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ _START_ADMIN_EXTRA = """
 |---------|-------------|
 | `/status` | System stats across all users |
 | `/sources_all` | The entire source database |
-| `/runpipeline` | Run the news cycle now |
+| `/runpipeline` | Run a full poll + send pass now |
 | `/testsource <url>` | Test if a URL is fetchable |
 
 You also bypass the per-user limits and can manage any user's stream by id.\
@@ -197,13 +198,40 @@ def _screen_stream(stream: dict, lang: str) -> tuple[str, InlineKeyboardMarkup]:
     rows = [
         [_btn(t(lang, "btn_sources"), f"menu:sources:{sid}"),
          _btn(t(lang, "btn_add_source"), f"menu:addsrc:{sid}")],
-        [toggle, _btn(t(lang, "btn_research"), f"menu:research:{sid}")],
+        [_btn(t(lang, "btn_tune_stream"), f"menu:tune:{sid}"),
+         _btn(t(lang, "btn_research"), f"menu:research:{sid}")],
+        [toggle],
         [_btn(t(lang, "btn_postlen"), f"menu:plen:{sid}"),
          _btn(t(lang, "btn_postlang"), f"menu:slang:{sid}")],
         [_btn(t(lang, "btn_quiet"), f"menu:quiet:{sid}"),
          _btn(t(lang, "btn_delete_stream"), f"menu:delstream:{sid}")],
         [_btn(t(lang, "btn_back"), "menu:streams")],
     ]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _rules_overview(stream: dict, lang: str) -> str:
+    """The stream's active tuning rules, one per line, for the tune screen."""
+    rules = [r for r in store.get_stream_rules(stream["id"]) if r.get("active")]
+    if not rules:
+        return t(lang, "tune_rules_none")
+    icons = {"exclude": "🚫", "include": "✅"}
+    return "\n".join(
+        t(lang, "tune_rule_line", rid=r["id"],
+          icon=icons.get(r.get("kind"), "❓"),
+          text=html_mod.escape(str(r.get("text", ""))))
+        for r in rules)
+
+
+def _screen_tune(stream: dict, lang: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Tune screen: current rules (tap 🗑 to drop one) + an armed text prompt."""
+    sid = stream["id"]
+    rules = [r for r in store.get_stream_rules(sid) if r.get("active")]
+    rows = [[_btn(f"🗑 #{r['id']} {str(r.get('text', ''))[:30]}",
+                  f"rule_del:{sid}:{r['id']}")] for r in rules[:20]]
+    rows.append([_btn(t(lang, "btn_back"), f"menu:stream:{sid}")])
+    text = t(lang, "menu_tune_title", name=html_mod.escape(stream["name"]),
+             rules=_rules_overview(stream, lang))
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -329,6 +357,11 @@ async def _handle_menu_nav(query, context, user_id: int, lang: str,
         await _safe_edit(query, *_screen_plen(stream, lang))
     elif verb == "slang":
         await _safe_edit(query, *_screen_slang(stream, lang))
+    elif verb == "tune":
+        # Arm the free-text handler: the user's next plain message is a tuning
+        # request for this stream.
+        context.user_data["tune_stream"] = sid_int
+        await _safe_edit(query, *_screen_tune(stream, lang))
     elif verb == "pause":
         store.update_stream_status(sid_int, "paused")
         await _safe_edit(query, *_screen_stream(store.get_stream(sid_int), lang))
@@ -1053,13 +1086,22 @@ async def _discover_and_add(chat_id: int, stream_id: int, raw_url: str,
     )
 
 
-async def handle_pending_source(update: Update,
-                                context: ContextTypes.DEFAULT_TYPE) -> None:
-    """A plain message after tapping “Add source” in the menu is the site URL.
+async def handle_free_text(update: Update,
+                           context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A plain message is routed by whatever the menu armed:
 
-    Only acts when the menu armed it (addsrc_stream set); otherwise ignores the
-    message so ordinary chatter isn't captured.
+    - tune_stream set  → a natural-language tuning request for that stream;
+    - addsrc_stream set → the site URL to add to that stream.
+
+    With nothing armed the message is ignored, so ordinary chatter isn't
+    captured.
     """
+    tune_id = context.user_data.get("tune_stream")
+    if tune_id:
+        context.user_data.pop("tune_stream", None)
+        await _handle_tune_message(update, context, int(tune_id))
+        return
+
     stream_id = context.user_data.get("addsrc_stream")
     if not stream_id:
         return
@@ -1082,6 +1124,104 @@ async def handle_pending_source(update: Update,
         return
 
     await _discover_and_add(chat_id, stream_id, text, lang, context)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tune stream — natural-language rules ("stop sending news about X")
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _handle_tune_message(update: Update,
+                               context: ContextTypes.DEFAULT_TYPE,
+                               stream_id: int) -> None:
+    """
+    Interpret the user's tuning request and ask for confirmation before
+    writing anything. Nothing is persisted on unclear / off_topic / ❌ —
+    the confirmation tap is the deterministic checkpoint that absorbs
+    disorganised input.
+    """
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    lang = _lang(user_id)
+    text = (update.message.text or "").strip()
+
+    owns, stream = await _owns_stream(user_id, stream_id)
+    if stream is None or not owns:
+        await send_rich_async(chat_id, t(lang, "not_your_stream"))
+        return
+    if not text:
+        await send_rich_async(chat_id, t(lang, "tune_unclear"))
+        return
+
+    criteria = stream.get("criteria") or {}
+    if not isinstance(criteria, dict):
+        criteria = {}
+    result = await interpret_rule_request(criteria, text)
+    action = result["action"]
+
+    if action == "off_topic":
+        await context.bot.send_message(
+            chat_id, t(lang, "tune_offtopic",
+                       name=html_mod.escape(stream["name"])),
+            parse_mode="HTML")
+        return
+
+    if action in ("add_exclude", "add_include"):
+        kind = "exclude" if action == "add_exclude" else "include"
+        rule_text = result["rule_text"]
+        if not rule_text:
+            await send_rich_async(chat_id, t(lang, "tune_unclear"))
+            return
+        rules = store.get_stream_rules(stream_id)
+        # The interpreter flags a duplicate by matched_rule_id — if that rule
+        # is active and points the same way, there's nothing to add.
+        match = next((r for r in rules if r.get("id") == result["matched_rule_id"]),
+                     None)
+        if match and match.get("active") and match.get("kind") == kind:
+            await send_rich_async(chat_id, t(lang, "tune_already"))
+            return
+        if sum(1 for r in rules if r.get("active")) >= config.MAX_STREAM_RULES:
+            await send_rich_async(
+                chat_id, t(lang, "tune_cap", max=config.MAX_STREAM_RULES))
+            return
+        context.user_data["pending_rule"] = {
+            "stream_id": stream_id, "op": "add",
+            "kind": kind, "text": rule_text,
+        }
+        confirm_key = ("tune_confirm_exclude" if kind == "exclude"
+                       else "tune_confirm_include")
+        await _ask_rule_confirm(context, chat_id, stream_id, lang,
+                                t(lang, confirm_key,
+                                  text=html_mod.escape(rule_text),
+                                  name=html_mod.escape(stream["name"])))
+        return
+
+    if action == "remove_rule":
+        rules = store.get_stream_rules(stream_id)
+        match = next((r for r in rules
+                      if r.get("id") == result["matched_rule_id"]
+                      and r.get("active")), None)
+        if not match:
+            await send_rich_async(chat_id, t(lang, "tune_unclear"))
+            return
+        context.user_data["pending_rule"] = {
+            "stream_id": stream_id, "op": "remove", "rule_id": match["id"],
+        }
+        await _ask_rule_confirm(context, chat_id, stream_id, lang,
+                                t(lang, "tune_confirm_remove",
+                                  text=html_mod.escape(str(match["text"])),
+                                  name=html_mod.escape(stream["name"])))
+        return
+
+    await send_rich_async(chat_id, t(lang, "tune_unclear"))
+
+
+async def _ask_rule_confirm(context, chat_id: int, stream_id: int, lang: str,
+                            prompt_html: str) -> None:
+    """The ✅/❌ checkpoint before any rule is written."""
+    rows = [[_btn(t(lang, "btn_rule_yes"), f"rule_ok:{stream_id}"),
+             _btn(t(lang, "btn_cancel"), f"rule_no:{stream_id}")]]
+    await context.bot.send_message(chat_id, prompt_html, parse_mode="HTML",
+                                   reply_markup=InlineKeyboardMarkup(rows))
 
 
 def _short(url: str, n: int = 34) -> str:
@@ -1279,6 +1419,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await query.edit_message_reply_markup(reply_markup=None)
             except Exception:
                 pass  # markup already gone (double tap) — the verdict stuck
+        return
+
+    # ── Tune stream: ✅/❌ on a proposed rule ────────────────────────────
+    if data.startswith(("rule_ok:", "rule_no:")):
+        sid = int(data.split(":", 1)[1])
+        pending = context.user_data.pop("pending_rule", None)
+        owns, stream = await _owns_stream(user_id, sid)
+        if stream is None or not owns:
+            await query.edit_message_text(t(lang, "not_your_stream"))
+            return
+        if not pending or pending.get("stream_id") != sid:
+            await query.edit_message_text(t(lang, "choice_expired"))
+            return
+        if data.startswith("rule_no:"):
+            await query.edit_message_text(t(lang, "tune_cancelled"))
+            return
+        name = html_mod.escape(stream["name"])
+        if pending["op"] == "add":
+            store.add_stream_rule(sid, pending["kind"], pending["text"])
+            await query.edit_message_text(t(lang, "tune_saved", name=name),
+                                          parse_mode="HTML")
+        else:
+            store.deactivate_stream_rule(sid, pending["rule_id"])
+            await query.edit_message_text(t(lang, "tune_removed", name=name),
+                                          parse_mode="HTML")
+        return
+
+    # ── Tune stream: 🗑 a rule straight off the tune screen ─────────────
+    if data.startswith("rule_del:"):
+        _, sid, rule_id = data.split(":", 2)
+        owns, stream = await _owns_stream(user_id, int(sid))
+        if stream is None or not owns:
+            await query.edit_message_text(t(lang, "not_your_stream"))
+            return
+        store.deactivate_stream_rule(int(sid), int(rule_id))
+        context.user_data["tune_stream"] = int(sid)   # prompt stays armed
+        await _safe_edit(query, *_screen_tune(store.get_stream(int(sid)), lang))
         return
 
     # ── Post length ───────────────────────────────────────────────────
@@ -1483,24 +1660,30 @@ async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 @admin_only
 async def cmd_runpipeline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manually run the same news cycle the cron runs (operator only)."""
+    """Manually run a full poll (all slots) + one send pass (operator only)."""
     chat_id = update.effective_chat.id
 
-    await send_rich_async(chat_id, "▶️ Running the news cycle...")
+    await send_rich_async(chat_id, "▶️ Running a full poll + send pass...")
 
-    result = await run_news_cycle()
-
-    if result.get("skipped"):
-        await send_rich_async(chat_id, "⏳ A cycle is already running — try again shortly.")
+    poll = await run_news_cycle(force_all_slots=True)
+    if poll.get("skipped"):
+        await send_rich_async(chat_id, "⏳ A poll is already running — try again shortly.")
         return
 
-    lines = [f"✅ Cycle complete — **{result['posted']}** posted "
-             f"from {result['candidates']} candidate(s)."]
-    if result.get("baselined_sources"):
-        lines.append(f"\n🆕 Baselined {result['baselined_sources']} new source(s) — "
+    send = await run_send_phase()
+    if send.get("skipped"):
+        send = {"posted": 0, "candidates": 0, "irrelevant": 0}
+
+    lines = [f"✅ Done — polled all sources, **{send['posted']}** posted "
+             f"from {send['candidates']} candidate(s)."]
+    if poll.get("baselined_sources"):
+        lines.append(f"\n🆕 Baselined {poll['baselined_sources']} new source(s) — "
                      f"their existing articles were recorded, not sent.")
-    if result.get("irrelevant"):
-        lines.append(f"\n🚫 {result['irrelevant']} filtered out as not relevant.")
+    if poll.get("queued"):
+        lines.append(f"\n📥 {poll['queued']} new article(s) queued "
+                     f"(the 5-min send tick delivers any left over).")
+    if send.get("irrelevant"):
+        lines.append(f"\n🚫 {send['irrelevant']} filtered out as not relevant.")
 
     await send_rich_async(chat_id, "".join(lines))
 
@@ -1544,7 +1727,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 | Dup-suppressed | {duplicates} |
 
 ---
-*The news cycle runs every {config.NEWS_CYCLE_MINUTES} min — up to {config.MAX_NEW_PER_SOURCE} new \
-articles per source, {config.MAX_POSTS_PER_STREAM_PER_CYCLE} posts per stream \
-({config.MAX_POSTS_PER_CYCLE} global) per cycle.*\
+*Poll tick every {config.POLL_TICK_MINUTES} min across {config.POLL_SLOTS} staggered slots — up to {config.MAX_NEW_PER_SOURCE} new \
+articles per source per poll. Send tick every {config.SEND_TICK_MINUTES} min — up to \
+{config.MAX_POSTS_PER_STREAM_PER_TICK} posts per stream ({config.MAX_POSTS_PER_TICK} global) per tick.*\
 """)

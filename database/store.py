@@ -129,6 +129,81 @@ def set_post_length(stream_id: int, length: str) -> bool:
     return set_stream_criteria_field(stream_id, "post_length", length)
 
 
+# ── Stream tuning rules ───────────────────────────────────────────────────────
+# Atomic user preferences ("never send X", "always send Y") living inside the
+# stream's criteria JSON. Append-only with soft-deactivation, so the tune flow
+# has an audit trail and re-adding an old rule just reactivates it.
+
+def get_stream_rules(stream_id: int) -> list[dict]:
+    """All rules (active and inactive) on the stream, oldest first."""
+    stream = get_stream(stream_id)
+    if not stream:
+        return []
+    criteria = stream.get("criteria") or {}
+    if not isinstance(criteria, dict):
+        return []
+    rules = criteria.get("rules")
+    return rules if isinstance(rules, list) else []
+
+
+def add_stream_rule(stream_id: int, kind: str, text: str) -> Optional[dict]:
+    """
+    Append a rule {"id", "kind", "text", "created_at", "active"} to the
+    stream's criteria. A rule with the same kind + text (case-insensitive) is
+    reactivated instead of duplicated. Returns the rule, or None if the
+    stream doesn't exist.
+    """
+    stream = get_stream(stream_id)
+    if not stream:
+        return None
+    criteria = stream.get("criteria") or {}
+    if not isinstance(criteria, dict):
+        criteria = {}
+    rules = criteria.get("rules")
+    if not isinstance(rules, list):
+        rules = []
+
+    norm = text.strip().lower()
+    for rule in rules:
+        if (rule.get("kind") == kind
+                and str(rule.get("text", "")).strip().lower() == norm):
+            rule["active"] = True
+            criteria["rules"] = rules
+            update_stream_criteria(stream_id, criteria)
+            return rule
+
+    rule = {
+        "id": max((int(r.get("id", 0)) for r in rules), default=0) + 1,
+        "kind": kind,
+        "text": text.strip(),
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "active": True,
+    }
+    rules.append(rule)
+    criteria["rules"] = rules
+    update_stream_criteria(stream_id, criteria)
+    return rule
+
+
+def deactivate_stream_rule(stream_id: int, rule_id: int) -> bool:
+    """Soft-delete a rule. False when the stream or rule doesn't exist."""
+    stream = get_stream(stream_id)
+    if not stream:
+        return False
+    criteria = stream.get("criteria") or {}
+    if not isinstance(criteria, dict):
+        return False
+    rules = criteria.get("rules")
+    if not isinstance(rules, list):
+        return False
+    for rule in rules:
+        if rule.get("id") == rule_id:
+            rule["active"] = False
+            update_stream_criteria(stream_id, criteria)
+            return True
+    return False
+
+
 # ── Users (interface preferences) ────────────────────────────────────────────
 
 def get_ui_lang(user_id: int) -> str:

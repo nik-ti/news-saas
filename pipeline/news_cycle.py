@@ -1,23 +1,25 @@
 """
 Pipeline — the news cycle.
 
-The single scheduled job. Every run:
+Two scheduled jobs, decoupled so a slow crawl never delays delivery:
 
-  Phase A — poll each DISTINCT active source once (however many streams follow
-            it). A source seen for the first time is BASELINED: everything
+  Poll tick (every POLL_TICK_MINUTES) — poll each DISTINCT active source in the
+            current slot (source.id % POLL_SLOTS) once, however many streams
+            follow it. A source seen for the first time is BASELINED: everything
             currently on its page is recorded and nothing is sent. Fresh
             articles fan out as one `deliveries` row per subscribed active
             stream.
-  Phase B — drain the deliveries queue serially: summarize → semantic dedup →
-            relevance gate (per-stream rubric) → write post → send to the
-            stream's owner, with a per-stream budget so one noisy stream can't
-            starve the others.
+  Send tick (every SEND_TICK_MINUTES) — drain a slice of the deliveries queue
+            serially: summarize → semantic dedup → relevance gate (per-stream
+            rubric) → write post → send to the stream's owner, with a per-stream
+            per-tick budget so one noisy stream can't starve the others.
 
-Every delivery leaves Phase B with a terminal status, so nothing is retried
-forever.
+Every delivery leaves the send phase with a terminal status, so nothing is
+retried forever.
 """
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import config
@@ -30,27 +32,47 @@ from pipeline.summarize import summarize_article, SKIP, STALE
 
 logger = logging.getLogger(__name__)
 
-# A cycle can outlive its 30-minute interval on a slow crawl. Never run two.
+# A poll can outlive its tick on a slow crawl. Never run two. The send phase
+# gets its OWN lock: both run on the bot's event loop, and a slow crawl must
+# never block send ticks.
 _cycle_lock = asyncio.Lock()
+_send_lock = asyncio.Lock()
 
 
-async def run_news_cycle() -> dict:
-    """Run one full cycle. Returns stats; skips if a cycle is already running."""
+async def run_news_cycle(force_all_slots: bool = False) -> dict:
+    """
+    Poll phase only (sending is the separate send tick — see run_send_phase).
+    Returns stats; skips if a poll is already running. `force_all_slots`
+    bypasses the slot gate (manual /runpipeline runs poll everything).
+    """
     if _cycle_lock.locked():
-        logger.warning("news_cycle: previous cycle still running — skipping this tick")
-        return {"skipped": True, "posted": 0, "candidates": 0}
+        logger.warning("news_cycle: previous poll still running — skipping this tick")
+        return {"skipped": True}
 
     async with _cycle_lock:
-        baselined, queued = await _baseline_and_fetch_phase()
+        slot = None if force_all_slots else _current_slot()
+        baselined, queued = await _baseline_and_fetch_phase(slot=slot)
+        logger.info("news_cycle poll done (slot %s): baselined=%d queued=%d",
+                    slot if slot is not None else "all", baselined, queued)
+        return {"skipped": False, "baselined_sources": baselined,
+                "queued": queued}
+
+
+async def run_send_phase() -> dict:
+    """Send phase: drain one tick's slice of the queue. Skips if a send is
+    already running."""
+    if _send_lock.locked():
+        logger.warning("send_phase: previous send still running — skipping this tick")
+        return {"skipped": True, "posted": 0, "candidates": 0}
+
+    async with _send_lock:
         stats = await _post_phase()
-        stats["baselined_sources"] = baselined
-        stats["queued"] = queued
         logger.info(
-            "news_cycle done: baselined=%d queued=%d candidates=%d posted=%d "
-            "irrelevant=%d duplicate=%d dropped=%d retry=%d",
-            baselined, queued, stats["candidates"], stats["posted"],
-            stats["irrelevant"], stats["duplicate"], stats["dropped"],
-            stats["retry"],
+            "send_phase done: candidates=%d posted=%d irrelevant=%d "
+            "duplicate=%d dropped=%d retry=%d held=%d stale=%d",
+            stats["candidates"], stats["posted"], stats["irrelevant"],
+            stats["duplicate"], stats["dropped"], stats["retry"],
+            stats["held"], stats["stale"],
         )
         return stats
 
@@ -69,14 +91,32 @@ def _looks_like_rebaseline(n_fresh: int, n_total: int) -> bool:
     return n_fresh / n_total >= config.REBASELINE_FRACTION
 
 
-def _due_for_poll(source: dict, now: datetime = None) -> bool:
+def _current_slot(now_ts: float = None) -> int:
+    """
+    Which of the POLL_SLOTS buckets this tick serves. Derived from wall-clock
+    time — deterministic across restarts, no state to persist.
+    """
+    ts = time.time() if now_ts is None else now_ts
+    return int(ts // (config.POLL_TICK_MINUTES * 60)) % config.POLL_SLOTS
+
+
+def _due_for_poll(source: dict, now: datetime = None, slot: int = None) -> bool:
     """
     Polling tiers (§2.6): every browser crawl costs a full Chromium render, so
     a source whose PROVEN publishing frequency is low skips ticks. RSS sources
     are always polled — their conditional GET usually costs one 304.
+
+    Slotting: with the poll tick shorter than the per-source interval, each
+    source is polled only when its stable bucket (id % POLL_SLOTS) is the
+    current slot — otherwise daily/unknown-tier sources would be crawled
+    POLL_SLOTS× more often. slot=None disables the gate (manual runs).
     """
     if (source.get("fetch_method") or "").lower() == "rss":
         return True
+    if slot is not None:
+        source_id = source.get("id")
+        if source_id is None or source_id % config.POLL_SLOTS != slot:
+            return False
     wait_hours = config.POLL_TIER_HOURS.get(source.get("pub_frequency") or "", 0)
     if wait_hours <= 0:
         return True
@@ -92,10 +132,12 @@ def _due_for_poll(source: dict, now: datetime = None) -> bool:
     return (now - last_dt).total_seconds() >= wait_hours * 3600
 
 
-async def _baseline_and_fetch_phase() -> tuple[int, int]:
-    """Snapshot every distinct active source once; baseline new ones, then fan
-    fresh articles out as deliveries to every subscribed active stream."""
-    sources = [s for s in store.get_active_sources() if _due_for_poll(s)]
+async def _baseline_and_fetch_phase(slot: int = None) -> tuple[int, int]:
+    """Snapshot every distinct active source in this slot once; baseline new
+    ones, then fan fresh articles out as deliveries to every subscribed active
+    stream. slot=None polls all due sources (manual runs)."""
+    sources = [s for s in store.get_active_sources()
+               if _due_for_poll(s, slot=slot)]
     if not sources:
         return 0, 0
 
@@ -221,7 +263,7 @@ async def _baseline_and_fetch_phase() -> tuple[int, int]:
             _mark_seen({item["content_hash"]})
 
         # Anything beyond the per-source cap is left undiscovered; it will be
-        # picked up next cycle (it stays absent from the dedup set).
+        # picked up on the next poll (it stays absent from the dedup set).
         if len(deliverable) > config.MAX_NEW_PER_SOURCE:
             logger.info("Source %s: %d new, capped to %d this cycle",
                         source["url"], len(deliverable), config.MAX_NEW_PER_SOURCE)
@@ -248,8 +290,8 @@ def _record_fetch_failure(source: dict, err: Exception) -> None:
 def _retry_or_drop(article_id: int, stream_id: int, why: str) -> str:
     """
     A transient failure (LLM outage, network blip, Telegram 5xx) must not cost
-    the user an article. Leave it queued and try again next cycle, until it has
-    burned through its attempt budget.
+    the user an article. Leave it queued and try again on the next send tick,
+    until it has burned through its attempt budget.
     """
     attempts = store.increment_delivery_attempts(article_id, stream_id)
     if attempts >= config.MAX_ARTICLE_ATTEMPTS:
@@ -347,17 +389,17 @@ def _feedback_keyboard(article_id: int, stream_id: int) -> dict:
 
 
 async def _post_phase() -> dict:
-    """Drain the deliveries queue serially, budgeted per stream."""
+    """Drain one send tick's slice of the deliveries queue, budgeted per stream."""
     queue = store.get_queued_deliveries(
-        per_stream_limit=config.MAX_POSTS_PER_STREAM_PER_CYCLE,
-        global_limit=config.MAX_POSTS_PER_CYCLE,
+        per_stream_limit=config.MAX_POSTS_PER_STREAM_PER_TICK,
+        global_limit=config.MAX_POSTS_PER_TICK,
     )
     stats = {"candidates": len(queue), "posted": 0, "irrelevant": 0,
              "duplicate": 0, "dropped": 0, "retry": 0, "held": 0, "stale": 0}
     if not queue:
         return stats
 
-    logger.info("news_cycle: processing %d queued deliveries", len(queue))
+    logger.info("send_phase: processing %d queued deliveries", len(queue))
 
     # One profile lookup per stream, not per delivery.
     profiles: dict[int, dict] = {}
